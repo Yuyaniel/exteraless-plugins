@@ -1,0 +1,1640 @@
+"""Auto Download — 按会话、按网络类型自动下载媒体文件。
+
+设计要点见 docs.md。核心是三层：
+
+1. 决策层（本文件顶部的纯函数 build_config / decide）——不依赖任何 SDK，
+   可用 tests/test_decision_engine.py 在桌面直接验证优先级语义。
+2. 适配层（AutoDownloadPlugin._resolve / _classify / _network）——所有对宿主
+   内部 API 的耦合都收敛在这里，全部运行时解析 + try/except 降级。
+3. UI 层（create_settings / 菜单项）。
+
+宿主类名与方法名会随 exteraGram 版本变化。本插件不硬编码任何常量值，
+所有 AUTODOWNLOAD_* 取值都在 on_plugin_load 时从宿主类上读取；
+读取结果会写进日志（见"运行自检"）。
+"""
+
+import json
+import os
+import time
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from base_plugin import (  # pyright: ignore[reportMissingImports]
+    BasePlugin,
+    MenuItemData,
+    MenuItemType,
+    MethodHook,
+)
+from client_utils import get_last_fragment  # pyright: ignore[reportMissingImports]
+from hook_utils import find_class  # pyright: ignore[reportMissingImports]
+from ui.alert import AlertDialogBuilder  # pyright: ignore[reportMissingImports]
+from ui.bulletin import BulletinHelper  # pyright: ignore[reportMissingImports]
+from ui.settings import (  # pyright: ignore[reportMissingImports]
+    Divider,
+    Header,
+    Selector,
+    Switch,
+    Text,
+)
+
+__id__ = "auto_download"
+__name__ = "Auto Download"
+__description__ = (
+    "按会话、按网络类型自动下载媒体。\n\n"
+    "可为单个频道/群组独立启用，并分别指定 WiFi 与移动数据下各自下载哪些媒体类型；"
+    "未单独配置的会话按默认规则执行，自定义配置优先于默认规则。"
+)
+__author__ = "@yuyaniel"
+__version__ = "1.1.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.5.0"
+
+# --------------------------------------------------------------------------
+# 常量与默认值（普通模块级常量，非元数据，可自由计算）
+# --------------------------------------------------------------------------
+
+# 媒体类型桶。顺序即设置页显示顺序。
+KINDS: Tuple[Tuple[str, str], ...] = (
+    ("photo", "图片"),
+    ("video", "视频"),
+    ("gif", "GIF / 动图"),
+    ("audio", "语音 / 音频"),
+    ("file", "文件"),
+)
+KIND_IDS: Tuple[str, ...] = tuple(kind for kind, _ in KINDS)
+KIND_LABELS: Dict[str, str] = dict(KINDS)
+
+NETWORKS: Tuple[Tuple[str, str], ...] = (("wifi", "WiFi"), ("mobile", "移动数据"))
+
+# 默认规则：WiFi 宽松，移动数据保守（只下图片）。
+DEFAULT_WIFI: Dict[str, bool] = {
+    "photo": True,
+    "video": True,
+    "gif": True,
+    "audio": True,
+    "file": False,
+}
+DEFAULT_MOBILE: Dict[str, bool] = {
+    "photo": True,
+    "video": False,
+    "gif": False,
+    "audio": False,
+    "file": False,
+}
+DEFAULT_BY_NET: Dict[str, Dict[str, bool]] = {
+    "wifi": DEFAULT_WIFI,
+    "mobile": DEFAULT_MOBILE,
+}
+
+# 默认作用范围
+SCOPE_ALL = 0      # 所有会话默认启用，可逐个关闭
+SCOPE_MANUAL = 1   # 仅已添加的会话启用
+
+# "允许"时返回哪个常量（兼容性开关）
+ALLOW_AUTO = 0
+ALLOW_WIFI = 1
+ALLOW_MOBILE = 2
+
+DC_CLASS_NAME = "org.telegram.messenger.DownloadController"
+CM_CLASS_NAME = "org.telegram.messenger.ConnectionsManager"
+CMAN_CLASS_NAME = "android.net.ConnectivityManager"
+HOOK_METHOD_NAME = "canDownloadMedia"
+
+NET_CACHE_TTL = 5.0          # 秒；网络状态缓存，避免每条消息都查一次
+CONFIG_CACHE_TTL = 3.0       # 秒；配置缓存，钩子是热路径，不能每条消息都全量读设置
+DIAG_PERSIST_LIMIT = 50      # 诊断记录最多往设置里落多少条（热路径，必须封顶）
+SAMPLE_LIMIT = 40            # int 返回值样本上限（按"方法+媒体+网络+决策"去重）
+MASK_METHODS = ("getAutodownloadMask", "getAutodownloadMaskAll")
+REPORT_NAME = "auto_download_report.txt"   # 自检报告落盘文件名（抓不到 logcat 时看它）
+
+
+# --------------------------------------------------------------------------
+# 决策层（纯函数，无 SDK 依赖，可本地单测）
+# --------------------------------------------------------------------------
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """把 Java 装箱值 / 字符串 / 数字统一成 int。"""
+    try:
+        return int(value)
+    except Exception:
+        pass
+    try:
+        return int(str(value))
+    except Exception:
+        return default
+
+
+def parse_peer_index(raw: Any) -> List[str]:
+    """把持久化的会话索引解析成有序、去重的字符串键列表。"""
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        key = str(item).strip()
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def build_config(get: Callable[[str, Any], Any]) -> Dict[str, Any]:
+    """把插件设置实体化成纯数据的配置字典。
+
+    唯一的对外依赖是 ``get(key, default)``：
+    设备上传 ``self.get_setting``，测试里传一个 dict 查找即可。
+    """
+    cfg: Dict[str, Any] = {
+        "enabled": bool(get("enabled", True)),
+        "log_decisions": bool(get("log_decisions", False)),
+        # 完全静默：连结构性诊断也不输出（只剩加载标记与错误）
+        "quiet": bool(get("quiet", False)),
+        "scope_mode": _as_int(get("scope_mode", SCOPE_ALL), SCOPE_ALL),
+        "defaults": {"wifi": {}, "mobile": {}},
+        "peers": {},
+    }
+
+    for net, _ in NETWORKS:
+        base = DEFAULT_BY_NET[net]
+        for kind in KIND_IDS:
+            cfg["defaults"][net][kind] = bool(
+                get("default_{}_{}".format(net, kind), base[kind])
+            )
+
+    for peer_key in parse_peer_index(get("peer_index", "[]")):
+        rule: Dict[str, Any] = {
+            "enabled": bool(get("peer_{}_enabled".format(peer_key), True)),
+            "wifi": {},
+            "mobile": {},
+        }
+        for net, _ in NETWORKS:
+            for kind in KIND_IDS:
+                rule[net][kind] = bool(
+                    get(
+                        "peer_{}_{}_{}".format(peer_key, net, kind),
+                        cfg["defaults"][net][kind],
+                    )
+                )
+        cfg["peers"][peer_key] = rule
+
+    return cfg
+
+
+def decide(
+    cfg: Dict[str, Any], peer_key: str, net: str, kind: str
+) -> Optional[bool]:
+    """决定一条媒体是否自动下载。
+
+    返回：
+        ``True``  允许下载
+        ``False`` 明确抑制下载
+        ``None``  不干预，交给应用自身规则
+
+    优先级（自上而下，命中即返回）：
+        1. 插件总开关关闭            -> None
+        2. 媒体类型无法识别          -> None
+        3. 会话有自定义配置：
+             a. 会话被显式禁用       -> False
+             b. 否则用会话自己的规则  -> 该规则
+        4. 无自定义配置 + 作用范围=全部会话 -> 默认规则
+        5. 无自定义配置 + 作用范围=仅已添加 -> None
+    """
+    if not cfg.get("enabled"):
+        return None
+    if kind not in KIND_IDS:
+        return None
+    if net not in DEFAULT_BY_NET:
+        net = "mobile"
+
+    peers = cfg.get("peers") or {}
+    rule = peers.get(peer_key)
+    if rule is not None:
+        if not rule.get("enabled"):
+            return False
+        return bool((rule.get(net) or {}).get(kind))
+
+    if cfg.get("scope_mode") == SCOPE_ALL:
+        return bool((cfg.get("defaults") or {}).get(net, {}).get(kind))
+
+    return None
+
+
+# --------------------------------------------------------------------------
+# 宿主 API 适配层
+# --------------------------------------------------------------------------
+
+
+class _Caps:
+    """记录运行时探测到的宿主能力。"""
+
+    def __init__(self) -> None:
+        self.ok = False
+        self.values: Dict[str, int] = {}
+        self.hooked: int = 0
+        self.notes: List[str] = []
+
+    def allow_value(self, net: str, mode: int) -> Optional[int]:
+        """按当前网络与兼容模式，返回表示"允许"的常量值。"""
+        if mode == ALLOW_WIFI:
+            order = ("AUTODOWNLOAD_WIFI",)
+        elif mode == ALLOW_MOBILE:
+            order = ("AUTODOWNLOAD_MOBILE",)
+        elif net == "wifi":
+            order = ("AUTODOWNLOAD_WIFI", "AUTODOWNLOAD_MOBILE")
+        else:
+            order = ("AUTODOWNLOAD_MOBILE", "AUTODOWNLOAD_WIFI")
+        for name in order:
+            if name in self.values:
+                return self.values[name]
+        return None
+
+    def disabled_value(self) -> Optional[int]:
+        return self.values.get("AUTODOWNLOAD_DISABLED")
+
+    def describe(self) -> str:
+        if self.values:
+            pairs = ", ".join(
+                "{}={}".format(k, v) for k, v in sorted(self.values.items())
+            )
+        else:
+            pairs = "（未读到任何 AUTODOWNLOAD_* 常量）"
+        lines = [
+            "类: {}".format(DC_CLASS_NAME),
+            "常量: {}".format(pairs),
+            "已挂钩重载数: {}".format(self.hooked),
+        ]
+        for note in self.notes:
+            lines.append("备注: {}".format(note))
+        return "\n".join(lines)
+
+
+class _CanDownloadHook(MethodHook):
+    """拦截 DownloadController.canDownloadMedia(...) 的返回值。"""
+
+    def __init__(self, plugin: "AutoDownloadPlugin") -> None:
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            self.plugin._on_can_download(param)
+        except Exception as error:  # 钩子里绝不能抛出去
+            self.plugin._error("canDownloadMedia 钩子异常: %s", error)
+
+
+# --------------------------------------------------------------------------
+# 插件
+# --------------------------------------------------------------------------
+
+
+class AutoDownloadPlugin(BasePlugin):
+    # ---------------- 生命周期 ----------------
+
+    def on_plugin_load(self) -> None:
+        # 导出实例，供探针插件诊断时读取状态
+        import auto_download as _this_mod  # noqa: PLC0415
+        _this_mod._ACTIVE_INSTANCE = self
+
+        self._caps = _Caps()
+        self._net_cache: Tuple[float, str] = (0.0, "")
+        self._cfg_cache: Tuple[float, Dict[str, Any]] = (0.0, {})
+        self._ret_cache: Dict[str, str] = {}
+        self._seen_methods: set = set()
+        self._seen_notes: Dict[str, set] = {}
+        self._label_cache: Dict[str, str] = {}
+        self._stats: Dict[str, Dict[str, int]] = {}
+        self._int_samples: List[str] = []
+        self._sample_keys: set = set()
+        self._mask_values: Dict[str, set] = {}
+        self._diag_count = 0
+        # 日志开关的普通属性副本（_config() 里刷新）。先在 _config() 之前
+        # 给个初值，否则 _classify 里的 _note_skip 会在首次 _config() 之前
+        # 就访问到它们。
+        self._diag_on = False
+        self._note_on = True
+        self._unhooks: List[Any] = []
+        self._menu_ids: List[str] = []
+
+        self._config()   # 让日志开关立即生效（顺带把配置缓存建好）
+        self._resolve_host_api()
+        self._register_menu_items()
+        self._write_report()
+
+        self._info(
+            "已加载 v%s；宿主能力：%s",
+            self.version,
+            self._caps.describe().replace("\n", " | "),
+        )
+
+    def on_plugin_unload(self) -> None:
+        for unhook in self._unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks = []
+        self._info("已卸载")
+
+    # ---------------- 宿主 API 探测 ----------------
+
+    def _resolve_host_api(self) -> None:
+        """解析宿主常量并挂钩。全部运行时进行，不硬编码任何取值。"""
+        caps = self._caps
+
+        dc_class = find_class(DC_CLASS_NAME)
+        if dc_class is None:
+            caps.notes.append("找不到 {}".format(DC_CLASS_NAME))
+            self._error("找不到 %s，插件将不做任何干预", DC_CLASS_NAME)
+            return
+
+        names = ("AUTODOWNLOAD_DISABLED", "AUTODOWNLOAD_WIFI", "AUTODOWNLOAD_MOBILE")
+        for name in names:
+            value = self._read_static_int(DC_CLASS_NAME, name, dc_class)
+            if value is not None:
+                caps.values[name] = value
+
+        # 固定名读不到时，把宿主上**真实存在**的 AUTODOWNLOAD* 字段全列出来：
+        # 有些构建用的是位掩码模型，没有那三个三态常量。
+        fields = self._read_autodownload_fields(DC_CLASS_NAME)
+        if fields:
+            caps.notes.append(
+                "AUTODOWNLOAD 字段（{} 个）: {}".format(
+                    len(fields),
+                    ", ".join(
+                        "{}={}".format(key, fields[key]) for key in sorted(fields)
+                    ),
+                )
+            )
+        else:
+            caps.notes.append(
+                "宿主类上没有任何 AUTODOWNLOAD* 静态字段 —— 这个构建用的是位掩码模型"
+            )
+
+        if not caps.values:
+            caps.notes.append("三态常量读取失败，int 返回值的重载将无法改写")
+
+        candidates = self._candidate_methods()
+        caps.notes.append(
+            "候选方法 {} 个: {}".format(len(candidates), self._describe_candidates(candidates))
+        )
+
+        unhooks: List[Any] = []
+        for item in candidates:
+            try:
+                found = self.hook_all_methods(
+                    dc_class, item["name"], _CanDownloadHook(self)
+                )
+            except Exception as error:
+                caps.notes.append("挂钩 {}: {}".format(item["name"], error))
+                continue
+            if found:
+                found = list(found)
+                unhooks.extend(found)
+                caps.notes.append("已挂 {}（{} 个重载）".format(item["name"], len(found)))
+
+        if unhooks:
+            self._unhooks = unhooks
+            caps.hooked = len(unhooks)
+            caps.ok = True
+        else:
+            caps.notes.append("没有挂上任何重载 —— 宿主不走 DownloadController 这条路径")
+
+    @staticmethod
+    def _method_signature(method: Any) -> str:
+        """把 java.lang.reflect.Method 拼成 'name(参数类型...) -> 返回类型'。"""
+        try:
+            name = str(method.getName())
+        except Exception:
+            name = "?"
+        try:
+            params = [str(param.getName()) for param in method.getParameterTypes()]
+        except Exception:
+            params = ["?"]
+        try:
+            ret = str(method.getReturnType().getName())
+        except Exception:
+            ret = "?"
+        return "{}({}) -> {}".format(name, ", ".join(params), ret)
+
+    def _candidate_methods(self) -> List[Dict[str, Any]]:
+        """运行时枚举候选方法，不硬编码单一名字。
+
+        宿主方法名会随版本变（这正是"装了没反应"的头号嫌疑），所以这里
+        不从文档抄名字，而是把 DownloadController 里名字含 candownload /
+        autodownload 的方法连同**签名**一起列出来；枚举失败才退回硬编码名称。
+
+        带上签名是为了诊断：名字对上了但参数形态不对时（例如某个无参重载
+        被调用），看 `_describe_candidates` 的输出就知道该改挂哪一个。
+        """
+        try:
+            from java.lang import Class  # noqa: PLC0415  (设备上才存在)
+
+            real = Class.forName(DC_CLASS_NAME)
+            grouped: Dict[str, Dict[str, Any]] = {}
+            for method in real.getDeclaredMethods():
+                try:
+                    name = str(method.getName())
+                except Exception:
+                    continue
+                low = name.lower()
+                if "candownload" not in low and "autodownload" not in low:
+                    continue
+                # 编译器生成的 lambda 内部方法（lambda$loadAutoDownloadConfig$1）
+                # 只是名字里带了 autodownload，挂上纯属噪音
+                if name.startswith("lambda$"):
+                    continue
+                entry = grouped.setdefault(
+                    name, {"name": name, "signatures": [], "param_counts": []}
+                )
+                entry["signatures"].append(AutoDownloadPlugin._method_signature(method))
+                try:
+                    entry["param_counts"].append(int(len(method.getParameterTypes())))
+                except Exception:
+                    entry["param_counts"].append(-1)
+            if grouped:
+                return [grouped[name] for name in sorted(grouped)]
+        except Exception as error:
+            self._error("枚举宿主方法失败(%s)，退回硬编码名称", error)
+        return [{"name": HOOK_METHOD_NAME, "signatures": [], "param_counts": [-1]}]
+
+    @staticmethod
+    def _describe_candidates(candidates: List[Dict[str, Any]]) -> str:
+        """把候选方法列表拼成一行可读文本，供日志与自检报告使用。"""
+        parts = []
+        for item in candidates:
+            counts = item.get("param_counts") or []
+            if counts and all(count == 0 for count in counts):
+                mark = " ← 全为无参重载，拿不到消息，无法干预"
+            else:
+                mark = ""
+            parts.append(
+                "{}: {}{}".format(
+                    item["name"], " | ".join(item.get("signatures") or []) or "签名未知", mark
+                )
+            )
+        return "  ;;  ".join(parts)
+
+    def _read_autodownload_fields(self, class_name: str) -> Dict[str, Any]:
+        """枚举宿主类上**所有**名字含 AUTODOWNLOAD 的静态字段。
+
+        实测：某些构建里 `AUTODOWNLOAD_DISABLED / WIFI / MOBILE` 一个都不存在
+        （这类构建走的是 `getAutodownloadMask() -> int` 的位掩码模型），
+        只按固定三个名字去读会一无所获。所以这里不猜名字，直接把真实字段表
+        打出来——拿到名字和值才有可能知道"允许"该回写成什么。
+        """
+        found: Dict[str, Any] = {}
+        try:
+            from java.lang import Class  # noqa: PLC0415  (设备上才存在)
+
+            real = Class.forName(class_name)
+            for field in real.getDeclaredFields():
+                try:
+                    name = str(field.getName())
+                except Exception:
+                    continue
+                if "AUTODOWNLOAD" not in name.upper():
+                    continue
+                try:
+                    field.setAccessible(True)
+                    value = field.get(None)
+                except Exception:
+                    value = None
+                found[name] = value
+        except Exception as error:
+            self._error("枚举 AUTODOWNLOAD 字段失败: %s", error)
+        return found
+
+    def _read_static_int(
+        self, class_name: str, field_name: str, java_class: Any = None
+    ) -> Optional[int]:
+        """读宿主类的静态 int 常量。
+
+        两条路径都试：先试 Chaquopy 对 JavaClass 的静态字段直读，
+        失败再走 java.lang.Class 反射。返回先成功的那个，都失败返回 None。
+        """
+        if java_class is None:
+            java_class = find_class(class_name)
+
+        if java_class is not None:
+            try:
+                value = getattr(java_class, field_name)
+                if value is not None:
+                    return _as_int(value)
+            except Exception:
+                pass
+
+        try:
+            from java.lang import Class  # noqa: PLC0415  (设备上才存在)
+
+            real = Class.forName(class_name)
+            field = real.getDeclaredField(field_name)
+            field.setAccessible(True)
+            return int(field.getInt(None))
+        except Exception:
+            return None
+
+    # ---------------- 钩子回调 ----------------
+
+    def _on_can_download(self, param: Any) -> None:
+        """拦截 canDownloadMedia 的返回值。
+
+        同时处理 MessageObject 重载和 (int,long) 重载——后者不带会话信息，
+        无法做按会话控制，但至少记录下来供诊断。
+        """
+        caps = self._caps
+        args = getattr(param, "args", None)
+        # 跨语言取一次方法标识，下面全部复用（以前这条链上算了 4 次）
+        raw = AutoDownloadPlugin._raw_key(param)
+        key = self._call_key(param, raw)
+        self._count("calls", key)
+        self._note_call(param, args, raw)
+        for name in MASK_METHODS:
+            if name in key:
+                self._note_mask_sample(key, param)
+                break
+        arg0 = args[0] if args and len(args) >= 1 else None
+
+        # 区分重载：
+        #   messageOwner  -> MessageObject
+        #   media 字段    -> TL Message（TLRPC$Message 也有 media，但没有 messageOwner）
+        #   (int, long)   -> 不带消息，只能记诊断
+        if arg0 is not None and (
+            hasattr(arg0, "messageOwner") or hasattr(arg0, "media")
+        ):
+            self._handle_message_object_hook(param, caps, arg0, raw)
+        elif arg0 is not None and len(args) >= 2:
+            self._handle_int_long_hook(param, caps, args, raw)
+        # 其余形态（无参、lambda、loadAutoDownloadConfig…）在 _note_call 里
+        # 已经记过一条带原返回值的完整信息，这里不再重复记
+
+    @staticmethod
+    def _raw_key(param: Any) -> str:
+        """被钩方法的稳定标识（`Method.toString()`）。
+
+        ⚠️ `str(param.method)` 是一次**跨语言调用**，是热路径上最贵的单项之一，
+        所以每次钩子调用只算一次，然后沿调用链传下去（raw 参数）。
+        以前这条链上要算 4 次。
+        """
+        try:
+            return str(param.method)
+        except Exception:
+            return "?"
+
+    def _call_key(self, param: Any, raw: str = "") -> str:
+        """被钩方法的可读短标签（按 raw 缓存，签名拼接只做一次）。"""
+        raw = raw or AutoDownloadPlugin._raw_key(param)
+        label = self._label_cache.get(raw)
+        if label is None:
+            label = AutoDownloadPlugin._describe_call(param)
+            self._label_cache[raw] = label
+        return label
+
+    def _count(self, bucket: str, key: str) -> None:
+        """按方法累计次数，供自检报告输出汇总表（不写日志，零 I/O）。"""
+        entry = self._stats.setdefault(key, {})
+        entry[bucket] = entry.get(bucket, 0) + 1
+
+    def _note_mask_sample(self, key: str, param: Any) -> None:
+        """记录掩码方法的返回值——**只在取值变化时**记一条。
+
+        实测某构建 `getAutodownloadMask()` 返回 `83886080 = 5 << 24`，
+        而 `5 = AUTODOWNLOAD_TYPE_PHOTO(1) | AUTODOWNLOAD_TYPE_VIDEO(4)`：
+        低 24 位另有用途，24 位以上才是"允许哪些媒体类型"。
+        把 `>>24` 和置位情况一并打出来，切换 WiFi/移动数据时就能直接读出差异。
+        """
+        try:
+            number = _as_int(param.getResult(), 0)
+        except Exception:
+            return
+        seen = self._mask_values.setdefault(key, set())
+        if number in seen:
+            return
+        seen.add(number)
+        bits = [
+            "bit{}".format(bit)
+            for bit in range(number.bit_length())
+            if number & (1 << bit)
+        ]
+        self._note(
+            "掩码取值: %s = %d (0x%X) | >>24 = %d | 置位: %s",
+            key,
+            number,
+            number,
+            number >> 24,
+            ", ".join(bits) or "无",
+        )
+
+    def _note_int_sample(
+        self, key: str, kind: Optional[str], net: str, decision: Any, original: Any
+    ) -> None:
+        """把 int 返回值按「方法 + 媒体 + 网络 + 决策」去重采样。
+
+        这是解开 int 语义的唯一途径：需要同时拿到"允许"和"拒绝"两种情况的
+        原返回值，才能知道"允许"该回写成什么。样本会写进自检报告。
+        """
+        if len(self._int_samples) >= SAMPLE_LIMIT:
+            return
+        label = "{} | 媒体={} 网络={} 决策={}".format(
+            key.split("(")[0], kind or "?", net, decision
+        )
+        if label in self._sample_keys:
+            return
+        self._sample_keys.add(label)
+        number = _as_int(original, 0) if original is not None else 0
+        self._int_samples.append(
+            "{} | 原返回值={} (0x{:X}, >>24={})".format(label, number, number, number >> 24)
+        )
+        self._note("int 样本 %d: %s", len(self._int_samples), self._int_samples[-1])
+
+    def _note_call(self, param: Any, args: Any = None, raw: str = "") -> None:
+        """每个被钩方法**第一次**触发时记一条完整信息，之后静默。
+
+        这些信息是有界的（每个方法一条），所以不受 `log_decisions` 控制：
+        出问题时它几乎是唯一的线索。带上签名、调用者、参数类型与**原返回值**
+        —— 原返回值是反推宿主 int 语义的关键。
+        以前对无参方法每次调用都记一条，一分钟能刷上千行纯噪音。
+        """
+        key = raw or AutoDownloadPlugin._raw_key(param)
+        if key in self._seen_methods:
+            return
+        self._seen_methods.add(key)
+
+        try:
+            result = param.getResult()
+        except Exception:
+            result = None
+        self._note(
+            "钩子触发 #%d: %s | 参数类型=%s | 原返回值=%r",
+            len(self._seen_methods),
+            self._call_key(param, key),
+            AutoDownloadPlugin._describe_args(args),
+            result,
+        )
+
+    @staticmethod
+    def _describe_args(args: Any) -> str:
+        """把实参按 Java 类型名列出来（只看类型，不看值）。"""
+        if args is None:
+            return "（取不到）"
+        try:
+            count = len(args)
+        except Exception:
+            return "（不可枚举）"
+        if count == 0:
+            return "空 —— 该方法无参数"
+        names = []
+        for index in range(count):
+            try:
+                names.append(str(args[index].getClass().getName()))
+            except Exception:
+                names.append("?")
+        return ", ".join(names)
+
+    @staticmethod
+    def _describe_call(param: Any) -> str:
+        """'方法签名 @ 调用者类名'，用于判断是哪个重载、谁在调。"""
+        try:
+            method = param.method
+        except Exception:
+            return "?"
+        base = AutoDownloadPlugin._method_signature(method)
+        try:
+            this = param.thisObject
+            owner = str(this.getClass().getName()) if this is not None else "static"
+        except Exception:
+            owner = "?"
+        return "{} @ {}".format(base, owner)
+
+    def _handle_message_object_hook(
+        self, param: Any, caps: "_Caps", message_object: Any, raw: str = ""
+    ) -> None:
+        key = self._call_key(param, raw)
+        kind = self._classify(message_object)
+        peer_key = self._peer_key_of(message_object)
+        net = self._network()
+        decision = decide(self._config(), peer_key, net, kind) if kind else None
+
+        # 必须带上真实方法名：同一条消息会被 canDownloadMedia(boolean) /
+        # canDownloadMediaInternal(int) / canDownloadMediaType(int) 各查一次，
+        # 以前这三条打出来是同一句话，日志看着像重复刷屏，实际是三个不同方法。
+        self._diag(
+            "%s | 媒体=%s 会话=%s 网络=%s 决策=%s",
+            key,
+            kind or "?",
+            peer_key or "?",
+            net,
+            decision,
+        )
+
+        if decision is None:
+            self._count("pass", key)
+            return
+
+        # 关键：不再假设返回值是 AUTODOWNLOAD_* 常量。
+        # 宿主返回 boolean 还是 int 随版本变，这里按实际返回类型决定回写什么。
+        ret = self._return_kind_of(param, raw)
+        try:
+            original = param.getResult()   # 必须在 setResult 之前读
+        except Exception:
+            original = None
+
+        if ret == "boolean":
+            before = bool(original)
+            param.setResult(bool(decision))
+            self._count("rewritten", key)
+            self._count("changed" if before != bool(decision) else "same", key)
+            self._diag(
+                "改写返回值 -> %s (%s)；原值=%s",
+                decision,
+                "允许" if decision else "抑制",
+                before,
+            )
+            return
+
+        if ret != "int":
+            self._count("unknown_ret", key)
+            self._diag("返回类型未知(%s)，放弃干预", ret)
+            return
+
+        self._note_int_sample(key, kind, net, decision, original)
+
+        if not caps.values:
+            self._count("aborted", key)
+            return
+
+        if decision:
+            mode = _as_int(
+                self.get_setting("allow_value_mode", ALLOW_AUTO), ALLOW_AUTO
+            )
+            value = caps.allow_value(net, mode)
+            if value is None:
+                self._diag("允许值计算失败(mode=%s)", mode)
+                return
+            param.setResult(value)
+            self._count("rewritten", key)
+            self._diag("改写返回值 -> %s (允许)", value)
+        else:
+            value = caps.disabled_value()
+            if value is None:
+                self._diag("DISABLED 常量未读到")
+                return
+            param.setResult(value)
+            self._count("rewritten", key)
+            self._diag("改写返回值 -> %s (抑制)", value)
+
+    def _return_kind_of(self, param: Any, raw: str = "") -> str:
+        """读被钩方法的真实返回类型（'boolean' / 'int' / 其它）。
+
+        反射调用按方法缓存，避免每条消息都反射一次。raw 由调用方传下来，
+        省掉一次 `str(param.method)` 跨语言调用。
+        """
+        key = raw or AutoDownloadPlugin._raw_key(param)
+        kind = self._ret_cache.get(key)
+        if kind is None:
+            try:
+                method = param.method
+                name = str(method.getReturnType().getName())
+            except Exception:
+                name = ""
+            kind = name
+            self._ret_cache[key] = kind
+        return kind
+
+    def _handle_int_long_hook(
+        self, param: Any, caps: "_Caps", args: Any, raw: str = ""
+    ) -> None:
+        """(int, long) 重载——不带 MessageObject，无法按会话控制。
+
+        参数含义（第二个是 dialogId 还是 size）随版本变，这里不做猜测，
+        只把实测到的**取值**记一条：如果第二个数像 dialog_id（正的用户 id 或
+        负的频道 id），说明这个重载也带会话信息，值得换成挂它。
+        `_note_call` 已记过签名与参数类型，这里补的是具体数值。
+        """
+        key = self._call_key(param, raw)
+        self._count("int_long", key)
+        if self._first_time("int_long", key):
+            self._note(
+                "重载不带 MessageObject，无法按会话控制: %s | 实参=%r",
+                key,
+                [str(item) for item in args],
+            )
+
+    def _diag(self, message: str, *args: Any) -> None:
+        """**每条消息的决策细节**。受 `log_decisions` 控制，默认关闭。
+
+        这条路径会在收媒体时高频触发（实测一分钟能刷出近两千行），
+        开着既有性能开销、又把真正有用的线索淹掉。排查时在设置里打开。
+
+        关闭时只做一次属性判断就返回：不碰 `_config()`、不拼字符串、不调 logger。
+        """
+        if not self._diag_on:
+            return
+        text = message % args if args else message
+        self._info("[诊断] %s", text)
+        self._persist_diag(text)
+
+    def _note(self, message: str, *args: Any) -> None:
+        """**结构性诊断**：候选方法、首次触发、常量缺失等。
+
+        条数有界（每个方法一条、每类问题一条），所以默认不受 `log_decisions`
+        控制 —— 出问题时这几乎是唯一的线索。
+
+        开了「完全静默」后这里也会被拦掉（只剩加载标记与错误）。
+        """
+        if not self._note_on:
+            return
+        text = message % args if args else message
+        self._info("[诊断] %s", text)
+        self._persist_diag(text)
+
+    def _persist_diag(self, text: str) -> None:
+        if self._diag_count >= DIAG_PERSIST_LIMIT:
+            return
+        try:
+            history = self.get_setting("_diag_history", [])
+            if not isinstance(history, list):
+                history = []
+            history.append("{}  {}".format(time.strftime("%H:%M:%S"), text))
+            if len(history) > 5:
+                history = history[-5:]
+            self.set_setting("_diag_history", history)
+            self._diag_count += 1
+        except Exception:
+            pass
+
+    def _first_time(self, bucket: str, key: str) -> bool:
+        """同一类提醒按 key 只放行一次。"""
+        seen = self._seen_notes.setdefault(bucket, set())
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    # ---------------- 媒体类型分类 ----------------
+
+    def _classify(self, message_object: Any) -> Optional[str]:
+        """把 MessageObject 归到 KINDS 之一；不属于可下载媒体则返回 None。
+
+        走 TL 结构（media 类型名 + document attributes），而不是
+        MessageObject.isVideo() 这类内部辅助方法——TL 结构是线协议的一部分，
+        跨版本稳定得多。
+
+        两条取 media 的路径都试：`messageOwner.media`（MessageObject）与
+        直接 `media`（TLRPC$Message —— 本机实测 `canDownloadMedia(TLRPC$Message)`
+        这种重载会传它）。
+        """
+        owner = getattr(message_object, "messageOwner", None)
+        media = getattr(owner, "media", None) if owner is not None else None
+        if media is None:
+            media = getattr(message_object, "media", None)
+        if media is None:
+            self._note_skip("纯文本/服务消息（media 为 None）")
+            return None
+
+        media_name = self._java_simple_name(media)
+        if media_name == "TL_messageMediaPhoto":
+            return "photo"
+        if media_name == "TL_messageMediaDocument":
+            return self._classify_document(getattr(media, "document", None))
+        # geo / venue / contact / poll / webpage / empty / unsupported 都不下载。
+        # 把**实际类名**记一条：如果哪天出现一个本该处理却没处理的类型，
+        # 日志会直接把它写出来，而不是只留一个含糊的「媒体=?」。
+        self._note_skip("未收录的 media 类名: {}".format(media_name or "（取不到类名）"))
+        return None
+
+    def _note_skip(self, reason: str) -> None:
+        """记录一次"这条消息不干预"的原因，每类只记一条（数量有界）。
+
+        只记不干预的**原因类别**，不记每条消息——既回答了
+        "哪些消息被跳过了、为什么"，又不会把日志刷爆。
+        """
+        if self._first_time("skip", reason):
+            self._note("不干预: %s", reason)
+
+    def _classify_document(self, document: Any) -> Optional[str]:
+        if document is None:
+            self._note_skip("TL_messageMediaDocument 但 document 为空")
+            return None
+        attributes = getattr(document, "attributes", None)
+        if attributes is None:
+            return "file"
+
+        names = set()
+        try:
+            count = int(attributes.size())
+        except Exception:
+            count = 0
+        for index in range(count):
+            try:
+                attr = attributes.get(index)
+            except Exception:
+                continue
+            names.add(self._java_simple_name(attr))
+
+        # 顺序重要：视频属性优先于动图属性
+        if "TL_documentAttributeVideo" in names:
+            return "video"
+        if "TL_documentAttributeAnimated" in names:
+            return "gif"
+        if "TL_documentAttributeAudio" in names:
+            # 语音与音乐归同一桶
+            return "audio"
+        if "TL_documentAttributeSticker" in names:
+            self._note_skip("贴纸（TL_documentAttributeSticker），交给应用")
+            return None
+        if "TL_documentAttributeImageSize" in names:
+            # 以"文件形式"发送的无压缩图片。之前会掉进 file 桶，
+            # 而 file 默认关闭 —— 表现就是"图片怎么都不自动下载"。
+            return "photo"
+        return "file"
+
+    @staticmethod
+    def _java_simple_name(obj: Any) -> str:
+        try:
+            return str(obj.getClass().getSimpleName())
+        except Exception:
+            return ""
+
+    # ---------------- 会话键 ----------------
+
+    def _peer_key_of(self, message_object: Any) -> Optional[str]:
+        owner = getattr(message_object, "messageOwner", None)
+        if owner is None:
+            return None
+        dialog_id = _as_int(getattr(owner, "dialog_id", 0), 0)
+        if not dialog_id:
+            dialog_id = self._dialog_id_from_peer(getattr(owner, "peer_id", None))
+        return str(dialog_id) if dialog_id else None
+
+    @staticmethod
+    def _dialog_id_from_peer(peer: Any) -> int:
+        if peer is None:
+            return 0
+        user_id = _as_int(getattr(peer, "user_id", 0), 0)
+        if user_id:
+            return user_id
+        chat_id = _as_int(getattr(peer, "chat_id", 0), 0)
+        if chat_id:
+            return -chat_id
+        channel_id = _as_int(getattr(peer, "channel_id", 0), 0)
+        if channel_id:
+            return -channel_id
+        return 0
+
+    # ---------------- 网络类型 ----------------
+
+    def _network(self) -> str:
+        """返回 'wifi' 或 'mobile'。未知网络按移动数据保守处理。"""
+        now = time.time()
+        stamp, cached = self._net_cache
+        if cached and now - stamp < NET_CACHE_TTL:
+            return cached
+
+        net = self._detect_network()
+        self._net_cache = (now, net)
+        return net
+
+    def _detect_network(self) -> str:
+        wifi = self._probe_connections_wifi()
+        if wifi is not None:
+            return "wifi" if wifi else "mobile"
+
+        kind = self._probe_connectivity_manager()
+        if kind is not None:
+            return kind
+
+        return "mobile"
+
+    def _probe_connections_wifi(self) -> Optional[bool]:
+        """优先用宿主自己的判断：ConnectionsManager.isConnectedToWiFi()。"""
+        try:
+            cm_class = find_class(CM_CLASS_NAME)
+            if cm_class is None:
+                return None
+            result = getattr(cm_class, "isConnectedToWiFi")
+            if callable(result):
+                return bool(result())
+        except Exception:
+            pass
+
+        try:
+            from java.lang import Class  # noqa: PLC0415
+
+            cm_class = Class.forName(CM_CLASS_NAME)
+            method = cm_class.getDeclaredMethod("isConnectedToWiFi")
+            method.setAccessible(True)
+            return bool(method.invoke(None))
+        except Exception:
+            return None
+
+    def _probe_connectivity_manager(self) -> Optional[str]:
+        """退路：直接问 Android ConnectivityManager。"""
+        try:
+            from org.telegram.messenger import (  # noqa: PLC0415
+                ApplicationLoader,
+            )
+
+            context = ApplicationLoader.applicationContext
+            if context is None:
+                return None
+            manager = context.getSystemService("connectivity")
+            if manager is None:
+                return None
+            info = manager.getActiveNetworkInfo()
+            if info is None or not info.isConnected():
+                return None
+
+            wifi_type = self._read_static_int(CMAN_CLASS_NAME, "TYPE_WIFI")
+            mobile_type = self._read_static_int(CMAN_CLASS_NAME, "TYPE_MOBILE")
+            current = _as_int(info.getType(), -1)
+            if wifi_type is not None and current == wifi_type:
+                return "wifi"
+            if mobile_type is not None and current == mobile_type:
+                return "mobile"
+            return None
+        except Exception:
+            return None
+
+    # ---------------- 配置读写 ----------------
+
+    def _config(self) -> Dict[str, Any]:
+        """实体化配置。钩子是热路径，做短 TTL 缓存。
+
+        配置变更最多延迟 CONFIG_CACHE_TTL 秒生效——对自动下载这种场景
+        完全可以接受，换来的是不必在每条消息上全量读一遍设置。
+        """
+        now = time.time()
+        stamp, cached = self._cfg_cache
+        if cached and now - stamp < CONFIG_CACHE_TTL:
+            return cached
+        cfg = build_config(self.get_setting)
+        self._cfg_cache = (now, cfg)
+        # 把日志开关摊成两个普通属性：热路径上的 _diag / _note 只读属性，
+        # 连 _config() 都不用调（哪怕只是 TTL 缓存命中也省一次函数调用）。
+        self._diag_on = bool(cfg["log_decisions"]) and not bool(cfg["quiet"])
+        self._note_on = not bool(cfg["quiet"])
+        return cfg
+
+    def _invalidate_config(self) -> None:
+        self._cfg_cache = (0.0, {})
+
+    def _peer_index(self) -> List[str]:
+        return parse_peer_index(self.get_setting("peer_index", "[]"))
+
+    def _save_peer_index(self, keys: List[str]) -> None:
+        self.set_setting("peer_index", json.dumps(keys))
+
+    def _default_for(self, net: str, kind: str) -> bool:
+        return bool(
+            self.get_setting(
+                "default_{}_{}".format(net, kind), DEFAULT_BY_NET[net][kind]
+            )
+        )
+
+    # ---------------- 菜单入口 ----------------
+
+    def _register_menu_items(self) -> None:
+        specs = (
+            (MenuItemType.CHAT_ACTION_MENU, "自动下载设置"),
+            (MenuItemType.PROFILE_ACTION_MENU, "自动下载设置"),
+        )
+        for menu_type, text in specs:
+            try:
+                item_id = self.add_menu_item(
+                    MenuItemData(
+                        menu_type=menu_type,
+                        text=text,
+                        on_click=self._on_chat_menu,
+                        icon="msg_settings",
+                        subtext="按会话配置自动下载",
+                        priority=10,
+                    )
+                )
+                if item_id:
+                    self._menu_ids.append(item_id)
+            except Exception as error:
+                self._info("注册菜单项失败（%s）: %s", menu_type, error)
+
+    def _on_chat_menu(self, context: Any) -> None:
+        try:
+            dialog_id = self._dialog_id_from_context(context)
+        except Exception as error:
+            self._error("读取菜单上下文失败: %s", error)
+            return
+
+        if not dialog_id:
+            BulletinHelper.show_error("无法识别当前会话")
+            return
+
+        peer_key = str(dialog_id)
+        title = self._title_from_context(context) or peer_key
+        self.set_setting("peer_title_{}".format(peer_key), title)
+        self._show_peer_dialog(peer_key, title, context)
+
+    @staticmethod
+    def _dialog_id_from_context(context: Any) -> int:
+        for key in ("dialog_id", "chatId", "userId"):
+            try:
+                value = context.get(key)
+            except Exception:
+                continue
+            dialog_id = _as_int(value, 0)
+            if dialog_id:
+                return dialog_id
+        # 退路：从 chat / user 对象推
+        for key, attr in (("chat", "id"), ("user", "id")):
+            try:
+                obj = context.get(key)
+            except Exception:
+                continue
+            if obj is None:
+                continue
+            value = _as_int(getattr(obj, attr, 0), 0)
+            if value:
+                return -value if key == "chat" else value
+        return 0
+
+    @staticmethod
+    def _title_from_context(context: Any) -> str:
+        for key in ("chat", "user", "chatFull", "userFull"):
+            try:
+                obj = context.get(key)
+            except Exception:
+                continue
+            if obj is None:
+                continue
+            for attr in ("title", "first_name", "name"):
+                value = getattr(obj, attr, None)
+                if value:
+                    return str(value)
+        return ""
+
+    def _show_peer_dialog(self, peer_key: str, title: str, context: Any) -> None:
+        configured = peer_key in self._peer_index()
+        enabled = bool(self.get_setting("peer_{}_enabled".format(peer_key), True))
+        if configured:
+            state = "已启用" if enabled else "已禁用"
+        else:
+            state = "未单独配置（跟随默认规则）"
+
+        activity = self._activity_from(context)
+        if activity is None:
+            # 拿不到 Activity 时退化成直接切换，不弹窗
+            self._cycle_peer(peer_key, title)
+            return
+
+        items = ["启用自动下载", "禁用自动下载", "移除该会话配置"]
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("{} — {}".format(title, state))
+        builder.set_items(items, partial(self._on_peer_dialog_item, peer_key, title))
+        builder.set_negative_button("取消", lambda bld, _which: bld.dismiss())
+        builder.show()
+
+    def _on_peer_dialog_item(
+        self, peer_key: str, title: str, builder: Any, which: int
+    ) -> None:
+        try:
+            if which == 0:
+                self._set_peer(peer_key, title, enabled=True)
+                BulletinHelper.show_success("已对「{}」启用自动下载".format(title))
+            elif which == 1:
+                self._set_peer(peer_key, title, enabled=False)
+                BulletinHelper.show_info("已对「{}」禁用自动下载".format(title))
+            else:
+                self._remove_peer(peer_key)
+                BulletinHelper.show_info("已移除「{}」的自定义配置".format(title))
+        except Exception as error:
+            self._error("处理会话配置失败: %s", error)
+        finally:
+            try:
+                builder.dismiss()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _activity_from(context: Any) -> Any:
+        fragment = None
+        try:
+            fragment = context.get("fragment")
+        except Exception:
+            fragment = None
+        if fragment is None:
+            try:
+                fragment = get_last_fragment()
+            except Exception:
+                fragment = None
+        if fragment is None:
+            return None
+        try:
+            return fragment.getParentActivity()
+        except Exception:
+            return None
+
+    def _cycle_peer(self, peer_key: str, title: str) -> None:
+        """没有弹窗条件时的退化路径：未配置 -> 启用；已启用 -> 禁用；已禁用 -> 移除。"""
+        keys = self._peer_index()
+        if peer_key not in keys:
+            self._set_peer(peer_key, title, enabled=True)
+            BulletinHelper.show_success("已对「{}」启用自动下载".format(title))
+        elif bool(self.get_setting("peer_{}_enabled".format(peer_key), True)):
+            self._set_peer(peer_key, title, enabled=False)
+            BulletinHelper.show_info("已对「{}」禁用自动下载".format(title))
+        else:
+            self._remove_peer(peer_key)
+            BulletinHelper.show_info("已移除「{}」的自定义配置".format(title))
+
+    def _set_peer(self, peer_key: str, title: str, enabled: bool) -> None:
+        keys = self._peer_index()
+        if peer_key not in keys:
+            keys.append(peer_key)
+            self._save_peer_index(keys)
+            # 首次加入时把当前默认规则固化成该会话的起点
+            for net, _ in NETWORKS:
+                for kind in KIND_IDS:
+                    self.set_setting(
+                        "peer_{}_{}_{}".format(peer_key, net, kind),
+                        self._default_for(net, kind),
+                    )
+        self.set_setting("peer_{}_enabled".format(peer_key), bool(enabled))
+        if title:
+            self.set_setting("peer_title_{}".format(peer_key), title)
+        self._invalidate_config()
+
+    def _remove_peer(self, peer_key: str) -> None:
+        keys = [key for key in self._peer_index() if key != peer_key]
+        self._save_peer_index(keys)
+        self._invalidate_config()
+
+    # ---------------- 设置页 ----------------
+
+    def create_settings(self) -> List[Any]:
+        peers = self._peer_index()
+        rows: List[Any] = [
+            Header(text="自动下载"),
+            Switch(
+                key="enabled",
+                text="启用插件",
+                default=True,
+                subtext="关闭后本插件完全不干预下载行为",
+            ),
+            # Selector 不接受 subtext（SDK 实测），说明只能写进相邻行的 Divider
+            Divider(text="决定未单独配置的会话是否套用默认规则"),
+            Selector(
+                key="scope_mode",
+                text="默认作用范围",
+                default=SCOPE_ALL,
+                items=["所有会话（可逐个关闭）", "仅已添加的会话"],
+            ),
+            Divider(),
+            Header(text="默认规则"),
+            Text(
+                text="WiFi 下自动下载",
+                subtext=self._summary("wifi"),
+                icon="msg_settings",
+                create_sub_fragment=partial(self._page_default, "wifi"),
+            ),
+            Text(
+                text="移动数据下自动下载",
+                subtext=self._summary("mobile"),
+                icon="msg_settings",
+                create_sub_fragment=partial(self._page_default, "mobile"),
+            ),
+            Text(
+                text="说明",
+                subtext="未单独配置的会话按上面的规则执行；单独配置过的会话以自身设置为准。",
+                icon="msg_info",
+            ),
+            Divider(),
+            Header(text="已配置的会话"),
+            Text(
+                text="管理已配置会话（{}）".format(len(peers)),
+                subtext="点击进入" if peers else "还没有单独配置的会话",
+                icon="msg_arrow_forward",
+                create_sub_fragment=self._page_peers,
+            ),
+            Divider(),
+            Header(text="高级"),
+            Switch(
+                key="log_decisions",
+                text="记录每条消息的决策日志",
+                default=False,
+                subtext="排查用；实测一分钟能刷近两千行，平时请保持关闭。"
+                        "「钩子触发」「常量缺失」这类结构性信息不受此开关影响",
+                on_change=lambda *_a, **_k: self._invalidate_config(),
+            ),
+            Switch(
+                key="quiet",
+                text="完全静默",
+                default=False,
+                subtext="连结构性诊断也不输出，只剩一行加载标记和错误信息。"
+                        "打开后日志量归零，但插件出问题时也没有任何线索可查",
+                on_change=lambda *_a, **_k: self._invalidate_config(),
+            ),
+            Divider(text="若下载行为与预期相反再调整此项"),
+            Selector(
+                key="allow_value_mode",
+                text="允许返回值（兼容）",
+                default=ALLOW_AUTO,
+                items=["自动（推荐）", "始终用 WIFI 常量", "始终用 MOBILE 常量"],
+            ),
+            Text(
+                text="运行自检",
+                subtext="检查宿主 API 并输出探测结果",
+                icon="msg_info",
+                on_click=self._on_self_check,
+            ),
+            Text(
+                text="最近诊断记录",
+                subtext=self._diag_summary(),
+                icon="msg_settings",
+                on_click=self._on_refresh_diag,
+            ),
+        ]
+        return rows
+
+    def _diag_summary(self) -> str:
+        history = self.get_setting("_diag_history", [])
+        if not history:
+            return "（还没有记录；收到媒体消息后会出现）"
+        return " | ".join(history[-3:])
+
+    def _on_refresh_diag(self, _view: Any = None) -> None:
+        self.set_setting("_diag_history", [], reload_settings=True)
+
+    def _summary(self, net: str) -> str:
+        labels = [
+            KIND_LABELS[kind] for kind in KIND_IDS if self._default_for(net, kind)
+        ]
+        return "、".join(labels) if labels else "（全部关闭）"
+
+    def _page_default(self, net: str) -> List[Any]:
+        label = dict(NETWORKS)[net]
+        rows: List[Any] = [Header(text="默认规则 · {} 下自动下载".format(label))]
+        for kind in KIND_IDS:
+            rows.append(
+                Switch(
+                    key="default_{}_{}".format(net, kind),
+                    text=KIND_LABELS[kind],
+                    default=DEFAULT_BY_NET[net][kind],
+                )
+            )
+        rows.append(Divider())
+        rows.append(
+            Text(
+                text="提示",
+                subtext="此处只影响未单独配置的会话；已配置的会话请在「已配置的会话」里调整。",
+                icon="msg_info",
+            )
+        )
+        return rows
+
+    def _page_peers(self) -> List[Any]:
+        keys = self._peer_index()
+        if not keys:
+            return [
+                Header(text="已配置的会话"),
+                Text(
+                    text="还没有单独配置的会话",
+                    subtext="在频道/群组里打开右上角菜单，选择「自动下载设置」即可添加。",
+                    icon="msg_info",
+                ),
+            ]
+
+        rows: List[Any] = [Header(text="已配置的会话（{}）".format(len(keys)))]
+        for key in keys:
+            title = str(self.get_setting("peer_title_{}".format(key), "") or key)
+            enabled = bool(self.get_setting("peer_{}_enabled".format(key), True))
+            rows.append(
+                Text(
+                    text=title,
+                    subtext="已启用" if enabled else "已禁用",
+                    icon="msg_arrow_forward",
+                    create_sub_fragment=partial(self._page_peer, key, title),
+                )
+            )
+        rows.append(Divider())
+        rows.append(
+            Text(
+                text="清空全部会话配置",
+                subtext="所有会话将回到默认规则",
+                icon="msg_error",
+                red=True,
+                on_click=self._on_clear_peers,
+            )
+        )
+        return rows
+
+    def _page_peer(self, key: str, title: str) -> List[Any]:
+        rows: List[Any] = [
+            Header(text=title),
+            Switch(
+                key="peer_{}_enabled".format(key),
+                text="对此会话启用自动下载",
+                default=True,
+                subtext="关闭后该会话完全不自动下载",
+            ),
+        ]
+        for net, label in NETWORKS:
+            rows.append(Header(text="{} 下自动下载".format(label)))
+            for kind in KIND_IDS:
+                rows.append(
+                    Switch(
+                        key="peer_{}_{}_{}".format(key, net, kind),
+                        text=KIND_LABELS[kind],
+                        default=self._default_for(net, kind),
+                    )
+                )
+        rows.append(Divider())
+        rows.append(
+            Text(
+                text="移除该会话配置",
+                subtext="移除后回到默认规则",
+                icon="msg_error",
+                red=True,
+                on_click=partial(self._on_remove_peer_click, key, title),
+            )
+        )
+        return rows
+
+    def _on_remove_peer_click(self, key: str, title: str, _view: Any = None) -> None:
+        self._remove_peer(key)
+        BulletinHelper.show_info("已移除「{}」的自定义配置".format(title))
+        self.set_setting(
+            "peer_index", json.dumps(self._peer_index()), reload_settings=True
+        )
+
+    def _on_clear_peers(self, _view: Any = None) -> None:
+        self._save_peer_index([])
+        BulletinHelper.show_info("已清空全部会话配置")
+        self.set_setting("peer_index", "[]", reload_settings=True)
+
+    def _on_self_check(self, _view: Any = None) -> None:
+        report = self._build_report()
+        self._info("%s", report.replace("\n", " | "))
+        path = self._write_report()
+        totals = self._stats_totals()
+        BulletinHelper.show_info(
+            "自检完成\n调用 {} 次 · 改写 {} 次 · 放弃 {} 次\n当前网络: {}\n报告: {}".format(
+                totals.get("calls", 0),
+                totals.get("rewritten", 0),
+                totals.get("aborted", 0),
+                self._network(),
+                path or "（写文件失败，只能看 logcat）",
+            )
+        )
+
+    def _build_report(self) -> str:
+        caps = self._caps
+        history = self.get_setting("_diag_history", [])
+        lines = [
+            "Auto Download 自检报告 v{}".format(self.version),
+            "=" * 46,
+            caps.describe(),
+            "当前网络判定: {}".format(self._network()),
+            "网络判定路径: {}".format(self._network_path()),
+            "已配置会话数: {}".format(len(self._peer_index())),
+            "挂载的钩子数: {}".format(len(self._unhooks)),
+            "已回写的返回类型: {}".format(
+                ", ".join(sorted(set(self._ret_cache.values()))) or "（还没被调用过）"
+            ),
+            "",
+            "## 各重载统计",
+        ]
+        lines.extend(self._stats_lines())
+        lines.extend(
+            [
+                "",
+                "判读：",
+                "  - 「改写」= 0 而「放弃」不为 0 ⇒ 那条重载返回 int，但宿主没有",
+                "    三态常量，它做的决定没落地",
+                "  - 「放过」= 媒体类型识别不出来（纯文本等），正常",
+                "",
+                "## int 返回值样本（解 int 语义用）",
+            ]
+        )
+        lines.extend(["  " + item for item in self._int_samples] or ["  （还没有样本）"])
+        lines.extend(
+            [
+                "",
+                "判读：把「允许」和「拒绝」两种情况的原返回值凑齐，就能看出编码。",
+                "  实测参考: getAutodownloadMask() = 83886080 = 5 << 24，",
+                "  而 5 = AUTODOWNLOAD_TYPE_PHOTO(1) | AUTODOWNLOAD_TYPE_VIDEO(4)。",
+                "  若 24 位以上是类型掩码，则 AUTODOWNLOAD_TYPE_* 的位值可直接复用。",
+                "",
+                "## 掩码取值（切换网络对比用）",
+            ]
+        )
+        if self._mask_values:
+            for name in sorted(self._mask_values):
+                for value in sorted(self._mask_values[name]):
+                    lines.append(
+                        "  {} = {} (0x{:X}) | >>24 = {}".format(
+                            name, value, value, value >> 24
+                        )
+                    )
+        else:
+            lines.append("  （还没取到）")
+        lines.extend(
+            [
+                "",
+                "## 最近诊断记录",
+            ]
+        )
+        lines.extend(history or ["  （还没有记录；收到媒体消息后会出现）"])
+        lines.extend(
+            [
+                "",
+                "判读：",
+                "  - 已挂钩重载数 = 0 ⇒ 宿主没有走 DownloadController，",
+                "    或应用自身的自动下载总开关是关的",
+                "  - 常量读不到但已挂钩 ⇒ 回写值按实际返回类型决定，看「已回写的返回类型」",
+                "  - 返回类型为空 ⇒ 钩子一次都没被触发",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _stats_totals(self) -> Dict[str, int]:
+        totals: Dict[str, int] = {}
+        for entry in self._stats.values():
+            for bucket, value in entry.items():
+                totals[bucket] = totals.get(bucket, 0) + value
+        return totals
+
+    def _stats_lines(self) -> List[str]:
+        """各重载的调用/落地统计。
+
+        收媒体时会被高频调用，全量日志能一分钟刷两千行；这份汇总表把
+        "哪条重载在做决定、决定了多少次、有没有落地"压成几行，看它比翻日志快。
+        """
+        if not self._stats:
+            return ["  （还没被调用过）"]
+        out: List[str] = []
+        for key in sorted(self._stats, key=lambda k: -self._stats[k].get("calls", 0)):
+            entry = self._stats[key]
+            out.append(
+                "  调用 {:<6} 改写 {:<6} 放弃 {:<6} 放过 {:<5}  {}".format(
+                    entry.get("calls", 0),
+                    entry.get("rewritten", 0),
+                    entry.get("aborted", 0),
+                    entry.get("pass", 0),
+                    key,
+                )
+            )
+        return out
+
+    def _write_report(self) -> str:
+        """把自检报告写成文件。
+
+        插件日志只走 logcat、不落盘，且启动后十几秒就抓不到了。设备在别的
+        地方（连不上 adb）时，这份文件是唯一能事后读到的证据 —— 用任意
+        root 文件管理器打开插件目录下的同名文件即可。
+        成功返回路径，失败返回空串。
+        """
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            return ""
+        if not base:
+            return ""
+        path = os.path.join(base, REPORT_NAME)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self._build_report())
+            return path
+        except Exception as error:
+            self._error("写自检报告失败: %s", error)
+            return ""
+
+    def _network_path(self) -> str:
+        if self._probe_connections_wifi() is not None:
+            return "ConnectionsManager.isConnectedToWiFi()"
+        if self._probe_connectivity_manager() is not None:
+            return "ConnectivityManager"
+        return "兜底（按移动数据）"
+
+    # ---------------- 日志 ----------------
+
+    def _info(self, message: str, *args: Any) -> None:
+        try:
+            self.logger.info(message, *args)
+            return
+        except Exception:
+            pass
+        try:
+            self.log(message % args if args else message)
+        except Exception:
+            pass
+
+    def _error(self, message: str, *args: Any) -> None:
+        try:
+            self.logger.error(message, *args)
+            return
+        except Exception:
+            pass
+        try:
+            self.log(message % args if args else message)
+        except Exception:
+            pass

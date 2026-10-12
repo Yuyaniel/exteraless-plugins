@@ -1,0 +1,17 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python (examples reference SDK modules that don't exist on desktop)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Agent tooling
+.cursor/
+.ua/

@@ -1,0 +1,2330 @@
+"""Message Filter — 按规则移除消息里匹配的部分，保留其余内容。
+
+设计要点见 docs.md。核心是三层：
+
+1. 规则引擎（本文件顶部的纯函数）——不依赖任何 SDK，
+   可用 tests/test_filter_engine.py 在桌面直接验证匹配与实体偏移换算。
+2. 适配层（MessageFilterPlugin._process / _remap_entities / _iter_messages）——
+   所有对宿主 TL 对象的读写都收敛在这里，全部运行时解析 + try/except 降级。
+3. UI 层（create_settings / 规则子页）。
+
+宿主类名与 TL 字段名会随 exteraGram 版本变化。本插件只碰
+`TLRPC.Message.message`（含媒体消息的字幕）与 `TLRPC.Message.entities`，
+不拦截请求、不取消操作、不改发送流程，失败一律降级为"不修改"。
+
+=================== v1.1.0 修复记录（对齐 tg_regex_filter v0.9.3 实测结论）===================
+
+真机（exteraless 12.10.6 / SDK 1.4.5.7）验证过的几件事，本版逐条修掉：
+
+1) 【会话键推导与菜单上下文对不上 → 会话规则永远不命中】
+   菜单上下文给的 dialog_id 与从消息 peer_id 推出来的值可能是两种写法：
+   频道既可能是 `-1001612089540`（带 -100 前缀），也可能是 `-1612089540`。
+   旧版只算一种写法，于是"在群里加的规则"永远匹配不上 —— 表现就是
+   **加了规则却什么都不删**。本版改成**候选集合**：把同一个 peer 的
+   所有等价写法都列出来，只要规则 scope 命中其中任一个就生效。
+   同时修掉 `chatId` / `userId` 的符号（chatId 是正数，会话键必须是负数）。
+
+2) 【只靠 getattr 读字段 → 某些构建上读不到】
+   参考插件在真机上实测：hook_utils 的字段读写不工作，必须走原始 Java 反射。
+   本版所有字段读写都是"属性访问优先 + java.lang.Class 反射兜底"，带缓存。
+
+3) 【正文只认 message 字段、消息只从 update 拿】
+   正文可能在 message / text / messageText / caption；宿主给的也可能不是裸的
+   TLRPC.Message（外层套 MessageObject 时正文在 messageText）。
+   本版做广度优先查找，并把新正文同步回 owner 的那份副本，避免两份不一致。
+
+4) 【删字后链接串位（用户最痛的点）】
+   真机上这份 TLRPC.Message 的 entities **是空的**，可跳转链接挂在宿主自己的
+   MessageObject 上，插件碰不到 —— 于是删字后所有 offset 失效，链接串到别的行。
+   本版两种策略：
+     * 拿得到 entities → 真删 + 按 orig 映射重排 offset/length（失败整体回滚）；
+     * 拿不到 entities → **等长隐身删除**：把被删字符原地换成等宽零宽空格
+       U+200B（非 BMP 字符补 2 个），总 UTF-16 长度一字不差 ⇒ offset 依旧有效
+       ⇒ 链接不可能串位。可在设置页关掉（"链接安全（等长隐身删除）"）。
+
+5) 【只挂 update 钩子 → 已经加载出来的历史消息不过滤】
+   本版同时挂请求钩子（getHistory / getMessages / search …），
+   走 post_request_hook 处理已加载的会话记录。
+
+6) 【加载期脆弱】
+   模块级 import 全部 try/except 降级；钩子逐个注册并回报结果；
+   启动时打一份 API 自检，便于一次定位。
+"""
+
+import json
+import re
+import threading
+import time
+from functools import partial
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from base_plugin import BasePlugin, HookResult, HookStrategy  # pyright: ignore[reportMissingImports]
+
+# 菜单项 API 在较老的 SDK 上可能没有 —— 缺失时插件其余功能照常工作
+try:
+    from base_plugin import MenuItemData, MenuItemType  # pyright: ignore[reportMissingImports]
+    _MENU_OK = True
+except Exception:  # pragma: no cover
+    MenuItemData = None
+    MenuItemType = None
+    _MENU_OK = False
+
+# 设置页控件：拿不到就整页返回空，绝不让 import 把插件搞崩
+try:
+    from ui.settings import (  # pyright: ignore[reportMissingImports]
+        Divider,
+        Header,
+        Input,
+        Selector,
+        Switch,
+        Text,
+    )
+    _UI_OK = True
+except Exception:  # pragma: no cover
+    Divider = Header = Input = Selector = Switch = Text = None
+    _UI_OK = False
+
+# 下面三个模块只用于「菜单弹窗 / 提示」，同样做降级处理
+try:
+    from client_utils import get_last_fragment  # pyright: ignore[reportMissingImports]
+except Exception:  # pragma: no cover
+    get_last_fragment = None
+
+try:
+    from ui.alert import AlertDialogBuilder  # pyright: ignore[reportMissingImports]
+except Exception:  # pragma: no cover
+    AlertDialogBuilder = None
+
+try:
+    from ui.bulletin import BulletinHelper  # pyright: ignore[reportMissingImports]
+except Exception:  # pragma: no cover
+    BulletinHelper = None
+
+__id__ = "message_filter"
+__name__ = "Message Filter"
+__description__ = "按自定义规则移除消息中的指定字符、词组或正则匹配内容——只删匹配的部分，保留消息其余内容，并可给处理过的消息加标记。支持多条规则按优先级顺序执行、逐条启用/禁用。"
+__author__ = "@yuyaniel"
+__version__ = "1.1.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.5.0"
+
+# --------------------------------------------------------------------------
+# 常量与默认值（普通模块级常量，非元数据，可自由计算）
+# --------------------------------------------------------------------------
+
+# 规则类型
+MODE_LITERAL = 0   # 词组 / 子串：整段匹配
+MODE_CHARS = 1     # 字符集合：删掉集合里出现过的每个字符
+MODE_REGEX = 2     # 正则表达式
+MODE_ITEMS = ["词组 / 子串", "字符集合", "正则表达式"]
+
+# 作用方向
+TARGET_IN = 0      # 只处理收到的消息
+TARGET_OUT = 1     # 只处理发出的消息
+TARGET_BOTH = 2    # 都处理
+TARGET_ITEMS = ["仅收到的消息", "仅发出的消息", "收 + 发"]
+TARGET_LABELS = {TARGET_IN: "收", TARGET_OUT: "发", TARGET_BOTH: "收发"}
+
+# 标记位置
+POS_PREFIX = 0
+POS_SUFFIX = 1
+POS_ITEMS = ["加在开头", "加在末尾"]
+
+# 过滤后整条文本被清空时的处置
+EMPTY_KEEP_EMPTY = 0     # 真的留空
+EMPTY_PLACEHOLDER = 1    # 换成占位文本
+EMPTY_ABORT = 2          # 放弃修改，保留原文（最保守）
+EMPTY_ITEMS = ["留空", "用占位文本", "放弃修改（保留原文）"]
+
+DEFAULT_MARKER = "🚫"
+DEFAULT_PLACEHOLDER = "（已过滤）"
+
+CONFIG_CACHE_TTL = 3.0       # 秒；规则缓存，收消息是热路径
+LOG_LIMIT = 20               # 过滤记录最多保留多少条
+LOG_WRITE_LIMIT = 60         # 本次会话最多往设置里写多少次（热路径封顶）
+CAPTURE_LIMIT = 30           # 样本捕获最多打多少条
+
+# 收到的消息：这些 update 里都带 message
+UPDATE_NAMES = (
+    "TL_updateNewMessage",
+    "TL_updateNewChannelMessage",
+    "TL_updateEditMessage",
+    "TL_updateEditChannelMessage",
+    "TL_updateNewScheduledMessage",
+)
+# 容器：里面的 updates / update 字段才是真正的 update
+CONTAINER_NAMES = ("TL_updates", "TL_updatesCombined", "TL_updateShort")
+# 会带来消息正文的请求 —— 处理「已经加载出来的历史消息」
+REQUEST_NAMES = (
+    "TL_messages_getHistory",
+    "TL_messages_getMessages",
+    "TL_messages_search",
+    "TL_messages_getPeerDialogs",
+    "TL_messages_getUnreadMentions",
+    "TL_messages_getReplies",
+)
+
+# 规则作用范围：空串 = 全局；否则是某个会话的 dialog_id 字符串
+GLOBAL_SCOPE = ""
+# 菜单项：群组/频道右上角菜单 + 个人资料页
+MENU_SPECS = (
+    (MenuItemType.CHAT_ACTION_MENU if _MENU_OK else None, "消息过滤规则"),
+    (MenuItemType.PROFILE_ACTION_MENU if _MENU_OK else None, "消息过滤规则"),
+)
+MENU_ICON = "msg_settings"
+
+# 正文可能存放的字段名。顺序即优先级：Telegram 标准是 message。
+TEXT_FIELDS = ("message", "text", "messageText", "caption", "captionText")
+# 文本字段 → 它对应的实体列表字段。
+# ⚠️ 必须一一对应：改的是 message，就不能去动 caption_entities ——
+#    那是另一段文本（媒体说明）的坐标，硬套会全乱。
+FIELD_ENTITIES = {
+    "message": "entities",
+    "text": "entities",
+    "messageText": "entities",
+    "caption": "caption_entities",
+    "captionText": "caption_entities",
+}
+# 实体可能挂在「外层包装对象」上（MessageObject：正文在 messageText，
+# entities 在 messageOwner 里）。除 msg 自身外，还要往这些容器里找。
+OWNER_FIELDS = ("messageOwner", "owner", "message", "msg", "replyMessage")
+# 正文来自「包装对象的文本字段」时，同步回写到 owner 的哪个字段
+TEXT_TO_OWNER = {"messageText": "message", "captionText": "caption"}
+
+# 零宽空格：不可见、不占视觉宽度，用来「吃掉」被删字符但保留长度
+_ZWSP = "\u200b"
+
+# 反射缓存（字段 / 方法查找结果）
+_FIELD_CACHE: Dict[Tuple[str, str], Any] = {}
+_METHOD_CACHE: Dict[Tuple[str, str], Any] = {}
+_JAVA_LOCK = threading.Lock()
+
+
+# --------------------------------------------------------------------------
+# 规则引擎（纯函数，无 SDK 依赖，可本地单测）
+# --------------------------------------------------------------------------
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """把 Java 装箱值 / 字符串 / 数字统一成 int。"""
+    try:
+        return int(value)
+    except Exception:
+        pass
+    try:
+        return int(str(value))
+    except Exception:
+        return default
+
+
+def parse_index(raw: Any) -> List[str]:
+    """把持久化的规则索引解析成有序、去重的 id 列表。"""
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        key = str(item).strip()
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def validate_pattern(mode: int, pattern: str) -> Optional[str]:
+    """检查规则是否合法。返回 None 表示可用，否则返回错误说明。"""
+    if not pattern:
+        return "匹配内容不能为空"
+    if mode == MODE_REGEX:
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            return "正则无效: {}".format(error)
+        except Exception as error:  # 正则里可能有 re 之外的异常
+            return "正则无效: {}".format(error)
+    return None
+
+
+def find_matches(text: str, mode: int, pattern: str, case_sensitive: bool) -> List[Tuple[int, int]]:
+    """返回全部匹配区间 [(start, end)]，互不重叠、按起点升序。
+
+    任何异常都吞掉并返回已找到的部分——规则引擎绝不能把消息处理流程搞崩。
+    """
+    if not text or not pattern:
+        return []
+    out: List[Tuple[int, int]] = []
+    try:
+        if mode == MODE_CHARS:
+            charset = set(pattern)
+            for index, char in enumerate(text):
+                if char in charset:
+                    out.append((index, index + 1))
+        elif mode == MODE_REGEX:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            for match in re.compile(pattern, flags).finditer(text):
+                start, end = match.start(), match.end()
+                if end > start:
+                    out.append((start, end))
+        else:
+            needle = pattern if case_sensitive else pattern.lower()
+            haystack = text if case_sensitive else text.lower()
+            cursor = 0
+            while True:
+                found = haystack.find(needle, cursor)
+                if found < 0:
+                    break
+                out.append((found, found + len(needle)))
+                cursor = found + max(1, len(needle))
+    except Exception:
+        return out
+    return out
+
+
+def _overlaps(start: int, end: int, taken: List[Tuple[int, int]]) -> bool:
+    for left, right in taken:
+        if not (end <= left or start >= right):
+            return True
+    return False
+
+
+def apply_matches(text: str, chosen: List[Tuple[int, int, str]]) -> str:
+    """把 [(start, end, replacement)] 应用到原文，得到新文本。"""
+    if not chosen:
+        return text
+    out: List[str] = []
+    cursor = 0
+    for start, end, replacement in chosen:
+        if start < cursor:
+            continue
+        out.append(text[cursor:start])
+        out.append(replacement)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def filter_message(
+    text: str,
+    rules: List[Dict[str, Any]],
+    marker: str = "",
+    marker_position: int = POS_PREFIX,
+    on_empty: int = EMPTY_PLACEHOLDER,
+    placeholder: str = DEFAULT_PLACEHOLDER,
+) -> Tuple[str, List[Tuple[int, int, str]], int, List[str]]:
+    """按优先级顺序应用规则。
+
+    所有规则的匹配都在**原文坐标**里算：后面的规则会跳过已被前面的规则
+    删掉的区间。这样 removals 始终处于同一坐标系，实体偏移才能正确换算。
+
+    返回 (new_text, removals, prefix_len, matched_ids)：
+        removals      [(start, end, replacement)]，原文坐标，供实体换算用
+        prefix_len    前缀标记的长度（实体偏移要整体右移这么多）
+        matched_ids   命中过的规则 id（按命中顺序去重）
+    new_text == text 表示没有改动，调用方应原样放行。
+    """
+    if not text or not rules:
+        return text, [], 0, []
+
+    taken: List[Tuple[int, int]] = []
+    chosen: List[Tuple[int, int, str]] = []
+    matched: List[str] = []
+
+    for rule in rules:
+        if validate_pattern(rule.get("mode", MODE_LITERAL), rule.get("pattern", "")):
+            continue
+        replacement = rule.get("replacement") or ""
+        for start, end in find_matches(
+            text,
+            rule.get("mode", MODE_LITERAL),
+            rule.get("pattern", ""),
+            bool(rule.get("case_sensitive", True)),
+        ):
+            if _overlaps(start, end, taken):
+                continue
+            taken.append((start, end))
+            chosen.append((start, end, replacement))
+            rule_id = str(rule.get("id", ""))
+            if rule_id and rule_id not in matched:
+                matched.append(rule_id)
+
+    chosen.sort(key=lambda item: (item[0], item[1]))
+    new_text = apply_matches(text, chosen)
+    if new_text == text:
+        return text, [], 0, []
+
+    prefix_len = 0
+    if new_text.strip() == "":
+        if on_empty == EMPTY_ABORT:
+            return text, [], 0, []
+        if on_empty == EMPTY_PLACEHOLDER:
+            new_text = placeholder
+        elif on_empty == EMPTY_KEEP_EMPTY:
+            pass  # 真的留空，后面只加标记
+
+    if marker:
+        if marker_position == POS_SUFFIX:
+            new_text = new_text + marker
+        else:
+            new_text = marker + new_text
+            prefix_len = len(marker)
+
+    return new_text, chosen, prefix_len, matched
+
+
+def map_pos(pos: int, removals: List[Tuple[int, int, str]]) -> int:
+    """把原文坐标 pos 换算到新文本坐标。
+
+    落在被删区间内部的点，塌缩到该区间替换文本的末尾；
+    其余点按"前面所有区间的长度变化"平移。
+    """
+    shift = 0
+    for start, end, replacement in removals:
+        if end <= pos:
+            shift += len(replacement) - (end - start)
+        elif start < pos < end:
+            return start + len(replacement) + shift
+        else:
+            break
+    return pos + shift
+
+
+def shift_entities(
+    entities: List[Tuple[int, int]],
+    removals: List[Tuple[int, int, str]],
+    prefix_len: int = 0,
+) -> List[Tuple[int, int, int]]:
+    """把消息实体（加粗/链接等）的偏移换算到新文本。
+
+    返回 [(原下标, 新 offset, 新 length)]；被完全删掉的实体不出现。
+    """
+    out: List[Tuple[int, int, int]] = []
+    for index, (offset, length) in enumerate(entities):
+        if length <= 0:
+            continue
+        new_offset = map_pos(offset, removals) + prefix_len
+        new_end = map_pos(offset + length, removals) + prefix_len
+        if new_end <= new_offset:
+            continue
+        out.append((index, new_offset, new_end - new_offset))
+    return out
+
+
+def target_allows(target: int, direction: str) -> bool:
+    """判断某条规则是否作用于指定方向。direction 为 'in' / 'out'。"""
+    if direction == "out":
+        return target in (TARGET_OUT, TARGET_BOTH)
+    return target in (TARGET_IN, TARGET_BOTH)
+
+
+def scope_allows(rule_scope: str, peer_key: Any) -> bool:
+    """判断某条规则是否覆盖这个会话。
+
+    - 空串 / "*"  ⇒ 全局，所有会话都生效
+    - 其它        ⇒ 只对 dialog_id 等于它的那个会话生效
+
+    peer_key 可以是单个字符串，也可以是**候选键集合**（同一个 peer 的
+    `-100xxx` / `-xxx` 两种写法）。集合匹配是本版修掉"会话规则永远不命中"
+    的关键：菜单上下文与消息 peer 推导出来的写法不一定一致。
+
+    拿不到会话（peer_key 为空）时，按会话绑定的规则一律**不生效**——
+    宁可漏过滤，也不要把某个群专用规则误伤到别的聊天。
+    """
+    scope = (rule_scope or "").strip()
+    if not scope or scope == "*":
+        return True
+    if not peer_key:
+        return False
+    if isinstance(peer_key, str):
+        return scope == peer_key
+    try:
+        return scope in peer_key
+    except Exception:
+        return False
+
+
+def parse_peer_key(raw: Any) -> str:
+    """把 Java 装箱的 dialog_id / 菜单 context 值统一成会话键字符串。"""
+    value = _as_int(raw, 0)
+    return str(value) if value else ""
+
+
+def dialog_candidates(dialog_id: int) -> Set[str]:
+    """把一个 dialog_id 展开成所有等价写法。
+
+    频道在不同层里可能是 `-1001612089540`（带 -100 前缀）或
+    `-1612089540`（裸 channel_id），两种写法必须都认。
+    """
+    out: Set[str] = set()
+    if not dialog_id:
+        return out
+    out.add(str(dialog_id))
+    magnitude = abs(dialog_id)
+    digits = str(magnitude)
+    if dialog_id < 0:
+        if digits.startswith("100") and len(digits) > 3:
+            out.add("-%s" % digits[3:])      # -1001612… → -1612…
+        else:
+            out.add("-100%s" % digits)       # -1612… → -1001612…
+    else:
+        out.add("-%d" % magnitude)           # 用户/正数 → 负数形态
+        out.add("-100%d" % magnitude)
+    return out
+
+
+def peer_candidates(kind: Optional[str], raw_id: int) -> Set[str]:
+    """由 (peer 类型, 内部 id) 展开出候选会话键。"""
+    out: Set[str] = set()
+    if not raw_id:
+        return out
+    magnitude = abs(raw_id)
+    if kind == "channel":
+        out.add("%d" % -magnitude)
+        out.add("-100%d" % magnitude)
+        out.add("%d" % magnitude)
+    elif kind == "chat":
+        out.add("%d" % -magnitude)
+        out.add("%d" % magnitude)
+    else:
+        out.add("%d" % raw_id)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Java 互操作（属性访问优先 + 原始 Java 反射兜底）
+#
+# 真机实测：hook_utils 的字段读写在本宿主上不工作；而且外层对象不一定是裸的
+# TLRPC.Message。所以这里一律「先 getattr，失败再走 java.lang.Class 反射」，
+# 并且列表读取多路探测，避免把「真的是空」误判成「工具坏了」。
+# --------------------------------------------------------------------------
+
+
+def _get_java_class(obj: Any) -> Any:
+    try:
+        return obj.getClass()
+    except Exception:
+        return None
+
+
+def _find_field(cls: Any, name: str) -> Any:
+    """沿父类链查找字段，带缓存。getDeclaredField 只查本类。"""
+    key = (str(cls), name)
+    with _JAVA_LOCK:
+        if key in _FIELD_CACHE:
+            return _FIELD_CACHE[key]
+    found = None
+    depth = 0
+    cur = cls
+    while cur is not None and depth < 12:
+        try:
+            found = cur.getDeclaredField(name)
+            try:
+                found.setAccessible(True)
+            except Exception:
+                pass
+            break
+        except Exception:
+            found = None
+            try:
+                cur = cur.getSuperclass()
+            except Exception:
+                break
+        depth += 1
+    with _JAVA_LOCK:
+        _FIELD_CACHE[key] = found
+    return found
+
+
+def _read_field(obj: Any, name: str) -> Any:
+    """读字段：先属性访问（覆盖公开字段与 getter），失败再走反射（私有字段）。"""
+    if obj is None:
+        return None
+    # 路径 A：Chaquopy 属性访问
+    try:
+        value = getattr(obj, name)
+        if value is not None:
+            if callable(value):
+                try:
+                    result = value()
+                    if result is not None:
+                        return result
+                except Exception:
+                    pass
+            else:
+                return value
+    except Exception:
+        pass
+    # 路径 B：原始 Java 反射
+    cls = _get_java_class(obj)
+    if cls is not None:
+        field = _find_field(cls, name)
+        if field is not None:
+            try:
+                return field.get(obj)
+            except Exception:
+                pass
+    return None
+
+
+def _write_field(obj: Any, name: str, value: Any) -> bool:
+    """写字段：先 setattr（Chaquopy 公开字段），失败再走反射。
+
+    TL 对象的 offset / length 通常是 `public final int`，
+    在 ART 上 setAccessible(True) 之后是可以写的。
+    """
+    if obj is None:
+        return False
+    try:
+        setattr(obj, name, value)
+        return True
+    except Exception:
+        pass
+    cls = _get_java_class(obj)
+    if cls is None:
+        return False
+    field = _find_field(cls, name)
+    if field is None:
+        return False
+    try:
+        field.set(obj, value)
+        return True
+    except Exception:
+        return False
+
+
+def _call_no_arg(obj: Any, name: str) -> Any:
+    """调用无参方法，带缓存。"""
+    if obj is None:
+        return None
+    cls = _get_java_class(obj)
+    if cls is None:
+        return None
+    key = (str(cls), name)
+    with _JAVA_LOCK:
+        method = _METHOD_CACHE.get(key, "MISS")
+    if method == "MISS":
+        method = None
+        depth = 0
+        cur = cls
+        while cur is not None and depth < 12:
+            try:
+                method = cur.getDeclaredMethod(name)
+                try:
+                    method.setAccessible(True)
+                except Exception:
+                    pass
+                break
+            except Exception:
+                method = None
+                try:
+                    cur = cur.getSuperclass()
+                except Exception:
+                    break
+            depth += 1
+        with _JAVA_LOCK:
+            _METHOD_CACHE[key] = method
+    if method is None:
+        return None
+    try:
+        return method.invoke(obj)
+    except Exception:
+        return None
+
+
+def _cls_name(obj: Any) -> str:
+    """对象类名，兼容 Java 对象与纯 Python 对象。"""
+    if obj is None:
+        return "None"
+    try:
+        return str(obj.getClass().getSimpleName())
+    except Exception:
+        pass
+    try:
+        return type(obj).__name__
+    except Exception:
+        return "?"
+
+
+def _is_text_like(value: Any) -> bool:
+    """是不是一段文本（Python str 或 Java String）。
+
+    不能只判断 `isinstance(value, str)`：某些构建上 Java String 不一定被
+    自动转换成 Python str，只认 str 会把正文当成"对象"，直接漏掉整条消息。
+    """
+    if isinstance(value, str):
+        return True
+    try:
+        return str(value.getClass().getName()) == "java.lang.String"
+    except Exception:
+        return False
+
+
+def _to_python_str(value: Any) -> Optional[str]:
+    """Java String → Python str；其他类型返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _is_scalar(value: Any) -> bool:
+    """标量（字符串/数字/布尔/字节）—— 用来把"容器字段"筛出来。"""
+    return isinstance(value, (str, bytes, bytearray, int, float, bool))
+
+
+def _iter_java_list(obj: Any) -> List[Any]:
+    """Java List / 数组 → Python list，多路探测取最长。
+
+    原来只有「size() + get()」一条路，一旦宿主返回的集合不是标准
+    java.util.List，就会静默返回 []，日志上和「真的是空列表」长得一样。
+    现在四条路各试一遍，取元素最多的那个。
+    """
+    if obj is None:
+        return []
+    if isinstance(obj, (list, tuple)):
+        return list(obj)
+
+    best: List[Any] = []
+
+    # A. Python 协议
+    try:
+        cand = list(obj)
+        if len(cand) > len(best):
+            best = cand
+    except Exception:
+        pass
+
+    # B. Java size() + get()
+    try:
+        size = int(obj.size())
+        cand = []
+        for index in range(size):
+            try:
+                cand.append(obj.get(index))
+            except Exception:
+                try:
+                    cand.append(obj[index])
+                except Exception:
+                    pass
+        if len(cand) > len(best):
+            best = cand
+    except Exception:
+        pass
+
+    # C. 原始反射调 size() + get(int)
+    if not best:
+        try:
+            cls = _get_java_class(obj)
+            if cls is not None:
+                size_method = None
+                cur, depth = cls, 0
+                while cur is not None and depth < 12:
+                    try:
+                        size_method = cur.getDeclaredMethod("size")
+                        try:
+                            size_method.setAccessible(True)
+                        except Exception:
+                            pass
+                        break
+                    except Exception:
+                        size_method = None
+                        try:
+                            cur = cur.getSuperclass()
+                        except Exception:
+                            break
+                    depth += 1
+                if size_method is not None:
+                    count = int(size_method.invoke(obj))
+                    get_method = None
+                    cur, depth = cls, 0
+                    while cur is not None and depth < 12:
+                        try:
+                            get_method = cur.getDeclaredMethod("get", int)
+                            try:
+                                get_method.setAccessible(True)
+                            except Exception:
+                                pass
+                            break
+                        except Exception:
+                            get_method = None
+                            try:
+                                cur = cur.getSuperclass()
+                            except Exception:
+                                break
+                        depth += 1
+                    cand = []
+                    if get_method is not None:
+                        for index in range(count):
+                            try:
+                                cand.append(get_method.invoke(obj, index))
+                            except Exception:
+                                pass
+                    if len(cand) > len(best):
+                        best = cand
+        except Exception:
+            pass
+
+    return best
+
+
+# --------------------------------------------------------------------------
+# 消息发现 / 正文提取 / 会话键
+# --------------------------------------------------------------------------
+
+
+def _has_text_field(obj: Any) -> bool:
+    """对象自己就是「包装过的消息」吗（正文在 messageText / captionText）。"""
+    for name in ("messageText", "captionText"):
+        value = _read_field(obj, name)
+        if value is not None and _is_text_like(value):
+            return True
+    return False
+
+
+def collect_messages(obj: Any, depth: int = 0, out: Optional[List[Any]] = None) -> List[Any]:
+    """从 update / updates 容器里取出所有 TL Message 对象。
+
+    不猜具体类名，只看字段形态：
+      * `.message` / `.msg` 是**文本** ⇒ obj 本身就是 TL Message，收下
+      * `.message` 是**对象**        ⇒ obj 是 update，收下它里面那个 Message
+      * 正文在 `.messageText`         ⇒ obj 是 MessageObject 之类的包装器，收下
+      * 都没有                       ⇒ 当成容器，递归进 updates / update
+    """
+    if out is None:
+        out = []
+    if obj is None or depth > 6:
+        return out
+
+    value = _read_field(obj, "message")
+    if value is None:
+        value = _read_field(obj, "msg")
+    if value is not None:
+        if _is_text_like(value):
+            out.append(obj)
+        elif not _is_scalar(value):
+            out.append(value)
+    elif _has_text_field(obj):
+        out.append(obj)
+
+    for attr in ("updates", "update"):
+        child = _read_field(obj, attr)
+        if child is None:
+            continue
+        for item in _iter_java_list(child):
+            collect_messages(item, depth + 1, out)
+    return out
+
+
+def extract_text(obj: Any) -> Tuple[Optional[str], Optional[str]]:
+    """取消息正文，返回 (字段名, 文本)。
+
+    正文可能在 message / text / messageText / caption —— 宿主给的也不一定是
+    裸的 TLRPC.Message（套了 MessageObject 时正文在 messageText）。
+    """
+    if obj is None:
+        return None, None
+    for name in TEXT_FIELDS:
+        value = _read_field(obj, name)
+        if value is None or not _is_text_like(value):
+            continue
+        text = _to_python_str(value)
+        if text and text.strip():
+            return name, text
+    return None, None
+
+
+def _peer_kind_and_id(peer: Any) -> Tuple[Optional[str], int]:
+    """从 TL_peerXxx 包装器（或裸整数）取出 (类型, 内部 id)。"""
+    if peer is None:
+        return None, 0
+    if isinstance(peer, int) and not isinstance(peer, bool):
+        return None, int(peer)
+    low = _cls_name(peer).lower()
+    raw = None
+    for name in ("user_id", "userId", "chat_id", "chatId",
+                 "channel_id", "channelId", "id"):
+        got = _read_field(peer, name)
+        if got is None:
+            try:
+                got = getattr(peer, name)
+                if callable(got):
+                    got = got()
+            except Exception:
+                got = None
+        if got is not None:
+            raw = got
+            break
+    if raw is None:
+        return None, 0
+    value = _as_int(raw, 0)
+    if "channel" in low:
+        return "channel", value
+    if "chat" in low:
+        return "chat", value
+    if "user" in low:
+        return "user", value
+    return None, value
+
+
+def peer_keys_of(message_obj: Any) -> Set[str]:
+    """算出这条消息所属会话的**全部候选键**。
+
+    这是本版最关键的一处修复：菜单里记下的 dialog_id 与这里推出来的值
+    可能分别是 `-100xxx` 和 `-xxx` 两种写法，只算一种就会"会话规则永不命中"。
+    """
+    keys: Set[str] = set()
+    if message_obj is None:
+        return keys
+
+    # 1) dialog_id 字段（宿主已归一化时最可靠）
+    dialog_id = _as_int(_read_field(message_obj, "dialog_id"), 0)
+    if dialog_id:
+        keys |= dialog_candidates(dialog_id)
+
+    # 2) peer_id 包装器
+    peer = _read_field(message_obj, "peer_id")
+    if peer is None:
+        peer = _read_field(message_obj, "peerId")
+    if peer is not None:
+        kind, raw_id = _peer_kind_and_id(peer)
+        keys |= peer_candidates(kind, raw_id)
+
+    # 3) from_id / user_id 兜底（私聊机器人）
+    if not keys:
+        for name in ("from_id", "user_id", "sender_id"):
+            sender = _read_field(message_obj, name)
+            if sender is None:
+                continue
+            kind, raw_id = _peer_kind_and_id(sender)
+            keys |= peer_candidates(kind, raw_id)
+            if keys:
+                break
+    return keys
+
+
+def peer_keys_from_value(raw: Any) -> Set[str]:
+    """从菜单上下文 / 发送参数里的 dialog_id 值算出候选键。"""
+    value = _as_int(raw, 0)
+    if not value:
+        return set()
+    keys = dialog_candidates(value)
+    if value > 0:
+        keys |= peer_candidates("user", value)
+    return keys
+
+
+def sync_text_to_owner(message_obj: Any, field: Optional[str], new_text: str) -> None:
+    """正文取自包装对象的文本字段时，把新正文同步回 owner 的那份副本。
+
+    例：MessageObject.messageText 改了，但 messageOwner.message 还是旧的，
+    两处不一致 → 宿主重绘/回传时会用旧文本覆盖。
+    """
+    if not field:
+        return
+    owner_field = TEXT_TO_OWNER.get(field)
+    if not owner_field:
+        return
+    for own in OWNER_FIELDS:
+        cont = _read_field(message_obj, own)
+        if cont is None or _is_scalar(cont):
+            continue
+        if _read_field(cont, owner_field) is None:
+            continue
+        _write_field(cont, owner_field, new_text)
+
+
+# --------------------------------------------------------------------------
+# entities 处理
+#
+# ⚠️ 真机实测：这份 TLRPC.Message 的 entities **是空的**，
+#    用户看到的可跳转链接挂在宿主自己的 MessageObject 上，插件碰不到。
+#    于是删字后 offset 全部失效 → 链接串位（名字和链接对不上）。
+#
+# 两条策略：
+#   A. 拿得到 entities → 真删 + 按 removals 重排 offset/length，失败整体回滚
+#   B. 拿不到 entities → 等长隐身删除（长度守恒，offset 不可能失效）
+# --------------------------------------------------------------------------
+
+
+def _entity_containers(message_obj: Any) -> List[Tuple[Any, str, Any]]:
+    """找出实体列表挂在哪个对象、哪个字段上，返回 [(容器, 字段名, 列表)]。"""
+    out: List[Tuple[Any, str, Any]] = []
+    if message_obj is None:
+        return out
+
+    nodes: List[Any] = [message_obj]
+    seen = set()
+    try:
+        seen.add(id(message_obj))
+    except Exception:
+        pass
+    queue = [message_obj]
+    depth = 0
+    while queue and depth < 3:
+        nxt: List[Any] = []
+        for node in queue:
+            for own in OWNER_FIELDS:
+                child = _read_field(node, own)
+                if child is None or _is_scalar(child):
+                    continue
+                try:
+                    if id(child) in seen:
+                        continue
+                    seen.add(id(child))
+                except Exception:
+                    pass
+                nodes.append(child)
+                nxt.append(child)
+        queue = nxt
+        depth += 1
+
+    for field, name in FIELD_ENTITIES.items():
+        for cont in nodes:
+            value = _read_field(cont, name)
+            if value is None:
+                value = _call_no_arg(cont, "get" + name[0].upper() + name[1:])
+            if value is None:
+                continue
+            items = _iter_java_list(value)
+            if items:
+                out.append((cont, name, value))
+                break
+    return out
+
+
+def _new_list(items: List[Any]) -> Any:
+    """构造一个 Java ArrayList；非 Android 环境退回 Python list。"""
+    try:
+        from java.util import ArrayList  # noqa: PLC0415  (设备上才存在)
+
+        built = ArrayList()
+        for item in items:
+            built.add(item)
+        return built
+    except Exception:
+        return list(items)
+
+
+def remap_entities(
+    containers: List[Tuple[Any, str, Any]],
+    removals: List[Tuple[int, int, str]],
+    prefix_len: int,
+) -> bool:
+    """把实体的 offset/length 重排到新文本。返回是否全部成功。
+
+    分两步，任何一步失败都**整体回滚**，绝不留下"文字删了、链接没跟上"
+    的半成品状态。
+    """
+    ok = True
+    for cont, name, _value in containers:
+        items = _iter_java_list(_read_field(cont, name))
+        if not items:
+            continue
+
+        objs: List[Any] = []
+        pairs: List[Tuple[int, int]] = []
+        for entity in items:
+            offset = _as_int(_read_field(entity, "offset"), -1)
+            length = _as_int(_read_field(entity, "length"), -1)
+            objs.append(entity)
+            pairs.append((max(0, offset), max(0, length)))
+
+        kept = shift_entities(pairs, removals, prefix_len)
+        unchanged = len(kept) == len(items) and all(
+            kept[i][0] == i
+            and kept[i][1] == pairs[i][0]
+            and kept[i][2] == pairs[i][1]
+            for i in range(len(kept))
+        )
+        if unchanged:
+            continue
+
+        backups: List[Tuple[Any, int, int]] = []
+        for index, new_offset, new_length in kept:
+            entity = objs[index]
+            backups.append((entity, pairs[index][0], pairs[index][1]))
+            if not _write_field(entity, "offset", int(new_offset)):
+                ok = False
+            if not _write_field(entity, "length", int(new_length)):
+                ok = False
+
+        survivors = [objs[index] for index, _o, _l in kept]
+        if not _write_field(cont, name, _new_list(survivors)):
+            ok = False
+
+        if not ok:
+            # 回滚：把 offset/length 与列表都恢复原样
+            for entity, old_offset, old_length in backups:
+                _write_field(entity, "offset", int(old_offset))
+                _write_field(entity, "length", int(old_length))
+            _write_field(cont, name, _new_list(items))
+            return False
+    return ok
+
+
+def blank_deleted(text: str, removals: List[Tuple[int, int, str]]) -> Optional[str]:
+    """等长隐身删除：把「被删掉的字符」原地换成等宽零宽字符。
+
+    背景：宿主不给我们 entities（`entities=0`），offset 摸不到也改不了。
+    那就不改 offset —— 让**总长度保持不变**，offset 自然依旧有效。
+
+    做法：把原文里被删掉的字符换成 U+200B，**宽度对齐**：
+        非 BMP 字符（emoji）占 2 个 UTF-16 单元 → 补 2 个 U+200B
+        其他字符占 1 个 → 补 1 个
+    于是 len_utf16(结果) == len_utf16(原文)，offset 全部有效。
+
+    返回 None 表示这次不适用（有替换文本、或整条都被删光）。
+    """
+    if not text:
+        return None
+    keep = [True] * len(text)
+    for start, end, replacement in removals:
+        if replacement:
+            return None          # 有替换文本就不适用等长隐身
+        for index in range(max(0, start), min(len(text), end)):
+            keep[index] = False
+    if all(keep):
+        return None
+    if not any(keep):
+        return None              # 整条被删光 → 交给"清空后的处置"逻辑
+    out: List[str] = []
+    for index, char in enumerate(text):
+        if keep[index]:
+            out.append(char)
+        else:
+            out.append(_ZWSP * (2 if ord(char) > 0xFFFF else 1))
+    return "".join(out)
+
+
+def _u16_len(text: str) -> int:
+    """UTF-16 code unit 长度（emoji 算 2）。"""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
+def _visible(text: str) -> str:
+    """去掉零宽字符，用于日志与展示。"""
+    return text.replace(_ZWSP, "")
+
+
+# --------------------------------------------------------------------------
+# 插件
+# --------------------------------------------------------------------------
+
+
+class MessageFilterPlugin(BasePlugin):
+    # ---------------- 生命周期 ----------------
+
+    def on_plugin_load(self) -> None:
+        # 导出实例，供探针插件诊断时读取状态（拿不到模块也不影响加载）
+        try:
+            import message_filter as _this_mod  # noqa: PLC0415
+
+            _this_mod._ACTIVE_INSTANCE = self
+        except Exception:
+            pass
+
+        self._cfg_cache: Tuple[float, Dict[str, Any]] = (0.0, {})
+        self._log_written = 0
+        self._capture_count = 0
+        self._activity: List[str] = []
+        self._seen_peers: Set[str] = set()
+
+        self._register_hooks()
+        self._register_menu_items()
+        self._self_check()
+
+        self._info(
+            "已加载 v%s；规则 %d 条（启用 %d 条）",
+            self.version,
+            len(self._rule_ids()),
+            len(self._config()["rules"]),
+        )
+
+    def on_plugin_unload(self) -> None:
+        self._info("已卸载")
+
+    # ---------------- 钩子注册 ----------------
+
+    def _add_hook(self, name: str) -> bool:
+        """注册一个钩子。先按精确名注册，SDK 不支持该参数时退回默认调用。"""
+        try:
+            self.add_hook(name, match_substring=False)
+            return True
+        except TypeError:
+            pass
+        except Exception as error:
+            self._error("注册钩子失败(%s): %s", name, error)
+            return False
+        try:
+            self.add_hook(name)
+            return True
+        except Exception as error:
+            self._error("注册钩子失败(%s): %s", name, error)
+            return False
+
+    def _register_hooks(self) -> None:
+        try:
+            self.add_on_send_message_hook()
+        except Exception as error:
+            self._error("注册发送钩子失败: %s", error)
+
+        ok = 0
+        total = 0
+        for name in UPDATE_NAMES + CONTAINER_NAMES + REQUEST_NAMES:
+            total += 1
+            if self._add_hook(name):
+                ok += 1
+        self._info("已注册 %d/%d 个钩子", ok, total)
+
+    def _self_check(self) -> None:
+        """列出本设备真实可用的 hook API —— 出问题时一次定位。"""
+        try:
+            names = sorted(dir(self))
+        except Exception:
+            return
+        hooks = [name for name in names if "hook" in name.lower()]
+        self._info(
+            "API 自检: add_hook=%s add_on_send_message_hook=%s logger=%s hooks=[%s]",
+            hasattr(self, "add_hook"),
+            hasattr(self, "add_on_send_message_hook"),
+            hasattr(self, "logger"),
+            ",".join(hooks),
+        )
+
+    # ---------------- 配置 ----------------
+
+    def _config(self) -> Dict[str, Any]:
+        """实体化配置。收消息是热路径，做短 TTL 缓存。"""
+        now = time.time()
+        stamp, cached = self._cfg_cache
+        if cached and now - stamp < CONFIG_CACHE_TTL:
+            return cached
+
+        cfg: Dict[str, Any] = {
+            "enabled": bool(self.get_setting("enabled", True)),
+            "rules": self._load_rules(),
+            "marker_enabled": bool(self.get_setting("marker_enabled", True)),
+            "marker": str(self.get_setting("marker_text", DEFAULT_MARKER) or ""),
+            "marker_position": _as_int(
+                self.get_setting("marker_position", POS_PREFIX), POS_PREFIX
+            ),
+            "on_empty": _as_int(
+                self.get_setting("on_empty", EMPTY_PLACEHOLDER), EMPTY_PLACEHOLDER
+            ),
+            "placeholder": str(
+                self.get_setting("empty_placeholder", DEFAULT_PLACEHOLDER)
+                or DEFAULT_PLACEHOLDER
+            ),
+            "fix_entities": bool(self.get_setting("fix_entities", True)),
+            "blank_fallback": bool(self.get_setting("blank_fallback", True)),
+            "capture_mode": bool(self.get_setting("capture_mode", False)),
+            "log_filtered": bool(self.get_setting("log_filtered", False)),
+        }
+        self._cfg_cache = (now, cfg)
+        return cfg
+
+    def _invalidate(self) -> None:
+        self._cfg_cache = (0.0, {})
+
+    def _rule_ids(self) -> List[str]:
+        return parse_index(self.get_setting("rule_index", "[]"))
+
+    def _load_rules(self) -> List[Dict[str, Any]]:
+        """读出全部**启用中**的规则，按索引顺序（即优先级顺序）。"""
+        rules: List[Dict[str, Any]] = []
+        for rule_id in self._rule_ids():
+            if not self.get_setting("rule_{}_enabled".format(rule_id), True):
+                continue
+            rules.append(
+                {
+                    "id": rule_id,
+                    "mode": _as_int(
+                        self.get_setting("rule_{}_mode".format(rule_id), MODE_LITERAL),
+                        MODE_LITERAL,
+                    ),
+                    "pattern": str(
+                        self.get_setting("rule_{}_pattern".format(rule_id), "") or ""
+                    ),
+                    "replacement": str(
+                        self.get_setting("rule_{}_replacement".format(rule_id), "") or ""
+                    ),
+                    "case_sensitive": bool(
+                        self.get_setting("rule_{}_case_sensitive".format(rule_id), True)
+                    ),
+                    "target": _as_int(
+                        self.get_setting("rule_{}_target".format(rule_id), TARGET_IN),
+                        TARGET_IN,
+                    ),
+                    "scope": str(
+                        self.get_setting("rule_{}_scope".format(rule_id), GLOBAL_SCOPE)
+                        or GLOBAL_SCOPE
+                    ),
+                }
+            )
+        return rules
+
+    def _peer_ids(self) -> List[str]:
+        """出现过会话规则的会话 id 列表（用于显示名称）。"""
+        return parse_index(self.get_setting("peer_index", "[]"))
+
+    def _remember_peer(self, peer_key: str, title: str) -> None:
+        if not peer_key:
+            return
+        peer_ids = self._peer_ids()
+        if peer_key not in peer_ids:
+            peer_ids.append(peer_key)
+            self.set_setting("peer_index", json.dumps(peer_ids))
+        if title:
+            self.set_setting("peer_title_{}".format(peer_key), title)
+
+    def _peer_label(self, peer_key: str) -> str:
+        if not peer_key:
+            return "全局（所有会话）"
+        title = str(self.get_setting("peer_title_{}".format(peer_key), "") or "")
+        return title or "会话 {}".format(peer_key)
+
+    def _scope_label(self, scope: str) -> str:
+        return "全局（所有会话）" if not scope else "仅「{}」".format(self._peer_label(scope))
+
+    def _rule_ids_of_scope(self, peer_key: str) -> List[str]:
+        """列出绑定到某个会话的规则 id（用候选键匹配，兼容两种写法）。"""
+        wanted = dialog_candidates(_as_int(peer_key, 0)) or {peer_key}
+        return [
+            rule_id
+            for rule_id in self._rule_ids()
+            if str(self.get_setting("rule_{}_scope".format(rule_id), GLOBAL_SCOPE) or "")
+            in wanted
+        ]
+
+    def _rules_for(self, direction: str, peer_keys: Any) -> List[Dict[str, Any]]:
+        """挑出某个方向 + 某个会话下应该生效的规则。"""
+        return [
+            rule
+            for rule in self._config()["rules"]
+            if target_allows(_as_int(rule.get("target", TARGET_IN), TARGET_IN), direction)
+            and scope_allows(str(rule.get("scope", GLOBAL_SCOPE) or ""), peer_keys)
+        ]
+
+    # ---------------- 消息处理 ----------------
+
+    @staticmethod
+    def _iter_messages(obj: Any) -> List[Any]:
+        """从 update / updates 容器里取出所有 TL Message 对象。"""
+        return collect_messages(obj)
+
+    @staticmethod
+    def _peer_keys_of(message_obj: Any) -> Set[str]:
+        return peer_keys_of(message_obj)
+
+    def _process(self, message_obj: Any, direction: str) -> bool:
+        """对单条 TL Message 应用规则。返回是否发生了修改。"""
+        cfg = self._config()
+        if not cfg["enabled"]:
+            return False
+
+        field, text = extract_text(message_obj)
+        if not field or not text:
+            return False
+
+        peer_keys = peer_keys_of(message_obj)
+        if peer_keys:
+            self._seen_peers |= peer_keys
+            if len(self._seen_peers) > 64:
+                self._seen_peers = set(sorted(self._seen_peers)[:32])
+        rules = self._rules_for(direction, peer_keys)
+        if not rules:
+            return False
+
+        # 「只观察不改」：把本该被处理的原文打进日志，确认钩子到底有没有在跑
+        if cfg["capture_mode"]:
+            if self._capture_count < CAPTURE_LIMIT:
+                self._capture_count += 1
+                self._info(
+                    "[样本#%d] peer=%s %r",
+                    self._capture_count,
+                    sorted(peer_keys)[:2] or "全局",
+                    text[:400],
+                )
+            return False
+
+        marker = cfg["marker"] if cfg["marker_enabled"] else ""
+        new_text, removals, prefix_len, matched = filter_message(
+            text,
+            rules,
+            marker=marker,
+            marker_position=cfg["marker_position"],
+            on_empty=cfg["on_empty"],
+            placeholder=cfg["placeholder"],
+        )
+        if new_text == text:
+            return False
+
+        final_text, mode = self._decide_output(
+            message_obj, field, text, new_text, removals, prefix_len, marker, cfg
+        )
+        if final_text == text:
+            # _decide_output 判定"这次别动"（实体重排失败）——保持原样
+            return False
+        if not _write_field(message_obj, field, final_text):
+            self._error("写回消息文本失败，已放弃修改（字段=%s）", field)
+            return False
+        sync_text_to_owner(message_obj, field, final_text)
+
+        self._info(
+            "[过滤] %s %d 字 -> %d 字，命中 %s，方式=%s",
+            direction,
+            len(text),
+            len(final_text),
+            ",".join(matched) or "?",
+            mode,
+        )
+        self._record(peer_keys, text, final_text, matched, mode)
+        if cfg["log_filtered"]:
+            self._log_filtered(text, final_text)
+        return True
+
+    def _decide_output(
+        self,
+        message_obj: Any,
+        field: str,
+        text: str,
+        new_text: str,
+        removals: List[Tuple[int, int, str]],
+        prefix_len: int,
+        marker: str,
+        cfg: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """决定最终文本与实体处置方式。返回 (最终文本, 方式说明)。"""
+        if not cfg["fix_entities"]:
+            return new_text, "不改实体"
+
+        containers = _entity_containers(message_obj)
+        if containers:
+            if remap_entities(containers, removals, prefix_len):
+                return new_text, "真删+重排实体"
+            # 重排失败 → 宁可不动，也不让链接串位
+            self._error("实体重排失败，已放弃本次删除（避免链接错位）")
+            return text, "放弃(实体失败)"
+
+        # 拿不到 entities：只有「还有可见内容」时才做等长隐身替换
+        if cfg["blank_fallback"] and _visible(new_text).strip():
+            candidate = blank_deleted(text, removals)
+            if candidate is not None and _u16_len(candidate) == _u16_len(text):
+                # 等长隐身下所有 offset 原地有效，标记只能放末尾
+                if marker:
+                    candidate = candidate + marker
+                return candidate, "等长隐身(保链接)"
+            if candidate is not None:
+                self._error("等长校验失败 → 退回真删")
+        return new_text, "真删"
+
+    def _log_filtered(self, before: str, after: str) -> None:
+        if self._log_written >= LOG_WRITE_LIMIT:
+            return
+        try:
+            history = self.get_setting("_filtered_log", [])
+            if not isinstance(history, list):
+                history = []
+            history.append(
+                "{}  {} ⇒ {}".format(
+                    time.strftime("%H:%M:%S"),
+                    self._short(_visible(before), 40),
+                    self._short(_visible(after), 40),
+                )
+            )
+            if len(history) > LOG_LIMIT:
+                history = history[-LOG_LIMIT:]
+            self.set_setting("_filtered_log", history)
+            self._log_written += 1
+        except Exception:
+            pass
+
+    def _record(
+        self,
+        peer_keys: Set[str],
+        before: str,
+        after: str,
+        matched: List[str],
+        mode: str,
+    ) -> None:
+        """最近处理记录：不用导日志也能看出插件在不在干活。"""
+        try:
+            label = sorted(peer_keys)[0] if peer_keys else "全局"
+            self._activity.append(
+                "{}  {}  命中 {}  {}({}→{})".format(
+                    time.strftime("%H:%M:%S"),
+                    label,
+                    ",".join(matched) or "?",
+                    mode,
+                    len(_visible(before)),
+                    len(_visible(after)),
+                )
+            )
+            if len(self._activity) > LOG_LIMIT:
+                del self._activity[0:len(self._activity) - LOG_LIMIT]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _short(text: str, limit: int) -> str:
+        flat = " ".join(text.split())
+        return flat if len(flat) <= limit else flat[:limit] + "…"
+
+    # ---------------- 事件钩子 ----------------
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        cfg = self._config()
+        if not cfg["enabled"]:
+            return HookResult()
+        changed = False
+        try:
+            for message_obj in self._iter_messages(update):
+                try:
+                    if self._process(message_obj, "in"):
+                        changed = True
+                except Exception as error:
+                    self._error("处理 update(%s) 异常: %s", update_name, error)
+        except Exception as error:
+            self._error("遍历 update(%s) 异常: %s", update_name, error)
+            return HookResult()
+        if changed:
+            return HookResult(strategy=HookStrategy.MODIFY, update=update)
+        return HookResult()
+
+    def on_updates_hook(self, container_name: str, account: int, updates: Any) -> HookResult:
+        cfg = self._config()
+        if not cfg["enabled"]:
+            return HookResult()
+        changed = False
+        try:
+            for message_obj in self._iter_messages(updates):
+                try:
+                    if self._process(message_obj, "in"):
+                        changed = True
+                except Exception as error:
+                    self._error("处理容器(%s) 异常: %s", container_name, error)
+        except Exception as error:
+            self._error("遍历容器(%s) 异常: %s", container_name, error)
+            return HookResult()
+        if changed:
+            return HookResult(strategy=HookStrategy.MODIFY, updates=updates)
+        return HookResult()
+
+    def post_request_hook(
+        self, request_name: str, account: int, response: Any, error: Any
+    ) -> HookResult:
+        """请求响应路径：处理「已经加载出来的历史消息」。
+
+        新消息主要走 on_update_hook；但打开会话 / 搜索 / 翻历史时，
+        消息是从响应里回来的，只有这条路径能覆盖。
+        """
+        try:
+            if error or response is None or request_name not in REQUEST_NAMES:
+                return HookResult()
+            cfg = self._config()
+            if not cfg["enabled"]:
+                return HookResult()
+
+            messages = _read_field(response, "messages")
+            if messages is None:
+                return HookResult()
+
+            changed = False
+            for message_obj in _iter_java_list(messages):
+                try:
+                    if self._process(message_obj, "in"):
+                        changed = True
+                except Exception as inner:
+                    self._error("处理响应消息异常: %s", inner)
+            if changed:
+                self._info("[响应] %s 已改写若干条", request_name)
+                return HookResult(strategy=HookStrategy.MODIFY, response=response)
+            return HookResult()
+        except Exception as error_:
+            self._error("post_request_hook 异常: %s", error_)
+            return HookResult()
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        cfg = self._config()
+        if not cfg["enabled"]:
+            return HookResult()
+        text = getattr(params, "message", None)
+        # 有些发送是纯媒体，message 可能是 None 或非字符串——必须校验
+        if not _is_text_like(text) or not text:
+            return HookResult()
+        text = _to_python_str(text)
+        if not text:
+            return HookResult()
+
+        # 发送参数里若带 dialog_id 就能做按会话过滤；没有就只应用全局规则
+        # （scope_allows 对空 peer_key 只会放行全局规则）
+        peer_keys = peer_keys_from_value(_read_field(params, "dialog_id"))
+        rules = self._rules_for("out", peer_keys)
+        if not rules:
+            return HookResult()
+
+        marker = cfg["marker"] if cfg["marker_enabled"] else ""
+        new_text, _removals, _prefix_len, matched = filter_message(
+            text,
+            rules,
+            marker=marker,
+            marker_position=cfg["marker_position"],
+            on_empty=cfg["on_empty"],
+            placeholder=cfg["placeholder"],
+        )
+        if new_text == text:
+            return HookResult()
+
+        params.message = new_text
+        self._info("[过滤] out %d 字 -> %d 字，命中 %s", len(text), len(new_text),
+                   ",".join(matched) or "?")
+        if cfg["log_filtered"]:
+            self._log_filtered(text, new_text)
+        # 外发消息没有现成的 entities，宿主会按新文本重新解析，无需修正
+        return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+    # ---------------- 设置页 ----------------
+
+    def create_settings(self) -> List[Any]:
+        if not _UI_OK:
+            return []
+        rule_ids = self._rule_ids()
+        rows: List[Any] = [
+            Header(text="消息过滤"),
+            Switch(
+                key="enabled",
+                text="启用插件",
+                default=True,
+                subtext="关闭后所有规则都不生效",
+            ),
+            Divider(),
+            Header(text="添加规则"),
+            Input(
+                key="new_rule_pattern",
+                text="匹配内容",
+                default="",
+                subtext="词组、字符集合或正则表达式",
+            ),
+            Divider(text="词组=整段匹配；字符集合=逐个删掉里面出现的每个字符；正则=Python re 语法"),
+            Selector(
+                key="new_rule_mode",
+                text="新规则类型",
+                default=MODE_LITERAL,
+                items=MODE_ITEMS,
+            ),
+            Text(
+                text="添加这条规则",
+                subtext="添加后可在下方进入该规则调整细节与优先级",
+                accent=True,
+                on_click=self._on_add_rule,
+            ),
+            Divider(),
+            Header(text="规则（{}）".format(len(rule_ids))),
+        ]
+
+        if not rule_ids:
+            rows.append(
+                Text(
+                    text="还没有规则",
+                    subtext="在上面填写匹配内容后点「添加这条规则」",
+                    icon="msg_info",
+                )
+            )
+        else:
+            for rule_id in rule_ids:
+                rows.append(
+                    Text(
+                        text=self._rule_title(rule_id),
+                        subtext=self._rule_subtext(rule_id),
+                        icon="msg_arrow_forward",
+                        create_sub_fragment=partial(self._page_rule, rule_id),
+                    )
+                )
+
+        rows.extend(
+            [
+                Divider(),
+                Header(text="过滤后的标记"),
+                Switch(
+                    key="marker_enabled",
+                    text="给处理过的消息加标记",
+                    default=True,
+                    subtext="只在消息真的被改动时才加",
+                ),
+                Input(
+                    key="marker_text",
+                    text="标记内容",
+                    default=DEFAULT_MARKER,
+                    subtext="可以用 emoji 或文字",
+                ),
+                Divider(text="加在开头时，消息的加粗/链接等格式会自动跟着平移"),
+                Selector(
+                    key="marker_position",
+                    text="标记位置",
+                    default=POS_PREFIX,
+                    items=POS_ITEMS,
+                ),
+                Divider(),
+                Header(text="边界情况"),
+                Divider(text="整条消息都被删空时怎么处理"),
+                Selector(
+                    key="on_empty",
+                    text="过滤后为空",
+                    default=EMPTY_PLACEHOLDER,
+                    items=EMPTY_ITEMS,
+                ),
+                Input(
+                    key="empty_placeholder",
+                    text="占位文本",
+                    default=DEFAULT_PLACEHOLDER,
+                ),
+                Switch(
+                    key="fix_entities",
+                    text="同步修正加粗/链接偏移",
+                    default=True,
+                    subtext="关掉可能导致格式错位，一般不要动",
+                ),
+                Switch(
+                    key="blank_fallback",
+                    text="链接安全（等长隐身删除）",
+                    default=True,
+                    subtext=(
+                        "拿不到格式实体时，把被删字符换成等宽零宽字符，"
+                        "保证链接不串位；此时标记会固定加在末尾"
+                    ),
+                ),
+                Switch(
+                    key="log_filtered",
+                    text="记录过滤记录",
+                    default=False,
+                    subtext="排查用；最多保留 {} 条".format(LOG_LIMIT),
+                ),
+                Divider(),
+                Header(text="诊断"),
+                Switch(
+                    key="capture_mode",
+                    text="只观察不改（样本捕获）",
+                    default=False,
+                    subtext="把命中的原文打进日志，用来确认钩子有没有在跑",
+                ),
+                Text(
+                    text="过滤记录",
+                    subtext="最近 {} 条".format(len(self._recent_log())),
+                    icon="msg_arrow_forward",
+                    create_sub_fragment=self._page_log,
+                ),
+                Text(
+                    text="运行自检",
+                    subtext="输出规则概况与宿主 API 概况",
+                    icon="msg_info",
+                    on_click=self._on_self_check,
+                ),
+            ]
+        )
+        return rows
+
+    # ---------------- 规则展示与子页 ----------------
+
+    def _rule_title(self, rule_id: str) -> str:
+        pattern = str(self.get_setting("rule_{}_pattern".format(rule_id), "") or "")
+        pattern = " ".join(pattern.split())
+        if not pattern:
+            return "（空规则）"
+        return pattern if len(pattern) <= 28 else pattern[:28] + "…"
+
+    def _rule_subtext(self, rule_id: str) -> str:
+        parts: List[str] = []
+        parts.append(
+            "启用" if self.get_setting("rule_{}_enabled".format(rule_id), True) else "已禁用"
+        )
+        mode = _as_int(self.get_setting("rule_{}_mode".format(rule_id), MODE_LITERAL), MODE_LITERAL)
+        parts.append(MODE_ITEMS[mode] if 0 <= mode < len(MODE_ITEMS) else "?")
+        target = _as_int(self.get_setting("rule_{}_target".format(rule_id), TARGET_IN), TARGET_IN)
+        parts.append(TARGET_LABELS.get(target, "?"))
+        scope = str(self.get_setting("rule_{}_scope".format(rule_id), GLOBAL_SCOPE) or "")
+        parts.append("仅「{}」".format(self._peer_label(scope)) if scope else "全局")
+
+        error = validate_pattern(
+            mode, str(self.get_setting("rule_{}_pattern".format(rule_id), "") or "")
+        )
+        if error:
+            parts.append("无效: {}".format(error))
+        return " · ".join(parts)
+
+    def _page_rule(self, rule_id: str) -> List[Any]:
+        if not _UI_OK:
+            return []
+        prefix = "rule_{}".format(rule_id)
+        mode = _as_int(self.get_setting(prefix + "_mode", MODE_LITERAL), MODE_LITERAL)
+        pattern = str(self.get_setting(prefix + "_pattern", "") or "")
+        scope = str(self.get_setting(prefix + "_scope", GLOBAL_SCOPE) or "")
+        rows: List[Any] = [
+            Header(text="规则"),
+            Text(
+                text="作用范围：{}".format(self._scope_label(scope)),
+                subtext=(
+                    "这条规则在任何聊天里都生效"
+                    if not scope
+                    else "只在那个会话生效；外发消息也要带上会话信息才会生效"
+                ),
+                icon="msg_info",
+            ),
+        ]
+        if scope:
+            rows.append(
+                Text(
+                    text="改为全局（所有会话）",
+                    subtext="改动后这条规则会在每个聊天里生效",
+                    icon="msg_arrow_forward",
+                    on_click=partial(self._on_make_global, rule_id),
+                )
+            )
+            rows.append(Divider())
+        rows.extend([
+            Switch(
+                key=prefix + "_enabled",
+                text="启用这条规则",
+                default=True,
+                on_change=lambda *_a, **_k: self._invalidate(),
+            ),
+            Selector(
+                key=prefix + "_mode",
+                text="类型",
+                default=MODE_LITERAL,
+                items=MODE_ITEMS,
+                on_change=lambda *_a, **_k: self._invalidate(),
+            ),
+            Input(
+                key=prefix + "_pattern",
+                text="匹配内容",
+                default=pattern,
+                on_change=lambda *_a, **_k: self._invalidate(),
+            ),
+            Input(
+                key=prefix + "_replacement",
+                text="替换为",
+                default="",
+                subtext="留空 = 直接删掉匹配部分",
+                on_change=lambda *_a, **_k: self._invalidate(),
+            ),
+            Divider(text="字符集合模式下，「替换为」对命中的每个字符分别生效"),
+            Switch(
+                key=prefix + "_case_sensitive",
+                text="区分大小写",
+                default=True,
+                on_change=lambda *_a, **_k: self._invalidate(),
+            ),
+            Divider(text="优先级 = 列表顺序，越靠前越先执行；已被前面的规则删掉的区间，后面的规则不再重复处理"),
+            Selector(
+                key=prefix + "_target",
+                text="作用方向",
+                default=TARGET_IN,
+                items=TARGET_ITEMS,
+                on_change=lambda *_a, **_k: self._invalidate(),
+            ),
+            Text(
+                text="上移（提高优先级）",
+                icon="msg_arrow_forward",
+                on_click=partial(self._on_move, rule_id, -1),
+            ),
+            Text(
+                text="下移（降低优先级）",
+                icon="msg_arrow_forward",
+                on_click=partial(self._on_move, rule_id, 1),
+            ),
+            Divider(),
+            Text(
+                text="删除这条规则",
+                subtext="删除后可重新添加，旧的残留设置键不影响使用",
+                icon="msg_error",
+                red=True,
+                on_click=partial(self._on_delete, rule_id),
+            ),
+        ])
+
+        error = validate_pattern(mode, pattern)
+        if error:
+            rows.insert(1, Text(text="这条规则无效", subtext=error, icon="msg_error", red=True))
+        return rows
+
+    # ---------------- 规则增删改 ----------------
+
+    def _create_rule(
+        self,
+        pattern: str,
+        mode: int,
+        scope: str = GLOBAL_SCOPE,
+        target: int = TARGET_IN,
+        reload_settings: bool = True,
+    ) -> str:
+        """新建一条规则，返回规则 id。调用方负责先校验 pattern。
+
+        scope 为空 = 全局；否则只在那个会话生效（从群组/频道菜单加进来的就是这种）。
+        """
+        seq = _as_int(self.get_setting("rule_seq", 0), 0) + 1
+        rule_id = "r{}".format(seq)
+        prefix = "rule_{}".format(rule_id)
+        self.set_setting("rule_seq", seq, reload_settings=False)
+        self.set_setting(prefix + "_pattern", pattern, reload_settings=False)
+        self.set_setting(prefix + "_mode", mode, reload_settings=False)
+        self.set_setting(prefix + "_replacement", "", reload_settings=False)
+        self.set_setting(prefix + "_enabled", True, reload_settings=False)
+        self.set_setting(prefix + "_case_sensitive", True, reload_settings=False)
+        self.set_setting(prefix + "_target", target, reload_settings=False)
+        self.set_setting(prefix + "_scope", scope, reload_settings=False)
+
+        # 全局规则排在会话规则之前：先跑通用的清理，再跑某个群专属的规则
+        rule_ids = self._rule_ids()
+        if scope:
+            rule_ids.append(rule_id)
+        else:
+            insert_at = len(rule_ids)
+            for index, existing in enumerate(rule_ids):
+                if str(
+                    self.get_setting("rule_{}_scope".format(existing), GLOBAL_SCOPE) or ""
+                ):
+                    insert_at = index  # 插到第一条会话规则之前
+                    break
+            rule_ids.insert(insert_at, rule_id)
+        if scope:
+            self._remember_peer(scope, str(self.get_setting("peer_title_{}".format(scope), "") or ""))
+        self.set_setting("rule_index", json.dumps(rule_ids), reload_settings=reload_settings)
+        self._invalidate()
+        return rule_id
+
+    def _on_add_rule(self, _view: Any = None) -> None:
+        pattern = str(self.get_setting("new_rule_pattern", "") or "").strip()
+        if not pattern:
+            self._toast("error", "先填写匹配内容")
+            return
+        mode = _as_int(self.get_setting("new_rule_mode", MODE_LITERAL), MODE_LITERAL)
+        error = validate_pattern(mode, pattern)
+        if error:
+            self._toast("error", error)
+            return
+
+        self.set_setting("new_rule_pattern", "", reload_settings=False)
+        self._create_rule(pattern, mode)  # 内部会重建设置页
+        self._toast("success", "已添加规则：{}".format(self._short(pattern, 20)))
+
+    def _on_move(self, rule_id: str, delta: int, _view: Any = None) -> None:
+        rule_ids = self._rule_ids()
+        if rule_id not in rule_ids:
+            return
+        index = rule_ids.index(rule_id)
+        target = index + delta
+        if target < 0 or target >= len(rule_ids):
+            return
+        rule_ids[index], rule_ids[target] = rule_ids[target], rule_ids[index]
+        self._invalidate()
+        self.set_setting("rule_index", json.dumps(rule_ids), reload_settings=True)
+
+    def _on_delete(self, rule_id: str, _view: Any = None) -> None:
+        rule_ids = [item for item in self._rule_ids() if item != rule_id]
+        self._invalidate()
+        self.set_setting("rule_index", json.dumps(rule_ids), reload_settings=True)
+        self._toast("info", "已删除规则")
+        # 注：该规则的 rule_<id>_* 设置键会残留，不影响使用
+
+    def _on_make_global(self, rule_id: str, _view: Any = None) -> None:
+        """把一条会话规则改成全局生效。"""
+        self._invalidate()
+        self.set_setting(
+            "rule_{}_scope".format(rule_id), GLOBAL_SCOPE, reload_settings=True
+        )
+        self._toast("info", "已改为全局生效")
+
+    # ---------------- 群组 / 频道菜单入口 ----------------
+    #
+    # 需求：在某个群组或频道的右上角菜单里直接加规则，并且**只在这个会话生效**，
+    # 不做全局生效。所以从菜单加的规则 scope = 该会话的 dialog_id。
+
+    def _register_menu_items(self) -> None:
+        if not _MENU_OK:
+            self._info("本 SDK 没有菜单项 API，跳过菜单注册")
+            return
+        for menu_type, text in MENU_SPECS:
+            try:
+                item_id = self.add_menu_item(
+                    MenuItemData(
+                        menu_type=menu_type,
+                        text=text,
+                        on_click=self._on_chat_menu,
+                        icon=MENU_ICON,
+                        subtext="只为这个会话添加过滤规则",
+                        priority=10,
+                    )
+                )
+                if not item_id:
+                    self._info("菜单项没有返回 id（%s）", menu_type)
+            except Exception as error:
+                self._info("注册菜单项失败（%s）: %s", menu_type, error)
+
+    def _on_chat_menu(self, context: Any) -> None:
+        try:
+            dialog_id = self._dialog_id_from_context(context)
+        except Exception as error:
+            self._error("读取菜单上下文失败: %s", error)
+            return
+        if not dialog_id:
+            self._toast("error", "无法识别当前会话")
+            return
+
+        peer_key = str(dialog_id)
+        title = self._title_from_context(context) or peer_key
+        self._remember_peer(peer_key, title)
+        activity = self._activity_from(context)
+        if activity is None:
+            self._toast("error", "拿不到界面上下文，请到插件设置里添加规则")
+            return
+        self._show_peer_dialog(peer_key, title, activity)
+
+    @staticmethod
+    def _dialog_id_from_context(context: Any) -> int:
+        """菜单 context 是 java.util.HashMap，只能用 get()，不能 .keys()。
+
+        ⚠️ `chatId` / `userId` 是**正数**，必须还原成会话键的符号：
+        聊天取负、用户取正。以前直接返回正数，导致"群里加的规则永不命中"。
+        """
+        def _get(key: str) -> Any:
+            try:
+                return context.get(key)
+            except Exception:
+                return None
+
+        dialog_id = _as_int(_get("dialog_id"), 0)
+        if dialog_id:
+            return dialog_id
+
+        for key, sign in (("chat", -1), ("user", 1)):
+            obj = _get(key)
+            if obj is None:
+                continue
+            value = _as_int(_read_field(obj, "id"), 0)
+            if value:
+                return sign * abs(value)
+
+        chat_id = _as_int(_get("chatId"), 0)
+        if chat_id:
+            return -abs(chat_id)
+        user_id = _as_int(_get("userId"), 0)
+        if user_id:
+            return abs(user_id)
+        return 0
+
+    @staticmethod
+    def _title_from_context(context: Any) -> str:
+        for key in ("chat", "user", "chatFull", "userFull"):
+            try:
+                obj = context.get(key)
+            except Exception:
+                continue
+            if obj is None:
+                continue
+            for attr in ("title", "first_name", "name"):
+                value = _read_field(obj, attr)
+                if value:
+                    return str(value)
+        return ""
+
+    @staticmethod
+    def _activity_from(context: Any) -> Any:
+        fragment = None
+        try:
+            fragment = context.get("fragment")
+        except Exception:
+            fragment = None
+        if fragment is None and get_last_fragment is not None:
+            try:
+                fragment = get_last_fragment()
+            except Exception:
+                fragment = None
+        if fragment is None:
+            return None
+        try:
+            return fragment.getParentActivity()
+        except Exception:
+            return None
+
+    # --- 一级对话框：本会话的规则列表 ---
+
+    def _show_peer_dialog(self, peer_key: str, title: str, activity: Any) -> None:
+        if AlertDialogBuilder is None:
+            self._toast("error", "本 SDK 不支持弹窗，请到插件设置里添加规则")
+            return
+        rule_ids = self._rule_ids_of_scope(peer_key)
+        items = ["＋ 添加规则（仅本会话）"]
+        for rule_id in rule_ids:
+            enabled = bool(self.get_setting("rule_{}_enabled".format(rule_id), True))
+            items.append(
+                "{}  {}".format(
+                    "✓" if enabled else "✗", self._rule_title(rule_id)
+                )
+            )
+        if not rule_ids:
+            items.append("（这个会话还没有专属规则）")
+
+        builder = AlertDialogBuilder(activity)
+        try:
+            builder.set_title("消息过滤 · {}".format(title))
+        except Exception:
+            pass
+        try:
+            builder.set_items(
+                items,
+                partial(self._on_peer_item, peer_key, title, activity, rule_ids),
+            )
+            builder.set_negative_button("关闭", lambda bld, _which: bld.dismiss())
+            builder.show()
+        except Exception as error:
+            self._error("弹窗失败: %s", error)
+            self._toast("error", "弹窗失败，请到插件设置里添加规则")
+
+    def _on_peer_item(
+        self,
+        peer_key: str,
+        title: str,
+        activity: Any,
+        rule_ids: List[str],
+        _builder: Any,
+        which: int,
+    ) -> None:
+        if which == 0:
+            self._show_add_rule_dialog(peer_key, title, activity)
+            return
+        index = which - 1
+        if 0 <= index < len(rule_ids):
+            self._show_rule_actions(peer_key, title, activity, rule_ids[index])
+
+    # --- 二级对话框：添加规则 ---
+
+    def _show_add_rule_dialog(self, peer_key: str, title: str, activity: Any) -> None:
+        mode = _as_int(self.get_setting("new_rule_mode", MODE_LITERAL), MODE_LITERAL)
+        field = None
+        try:
+            from android.widget import EditText  # noqa: PLC0415
+
+            field = EditText(activity)
+            field.setHint("要移除的内容：词组或正则")
+            try:
+                field.setText(str(self.get_setting("new_rule_pattern", "") or ""))
+            except Exception:
+                pass
+        except Exception as error:
+            self._error("创建输入框失败: %s", error)
+            self._toast("error", "这个版本建不了输入框，请到插件设置里添加规则")
+            return
+
+        if AlertDialogBuilder is None:
+            self._toast("error", "本 SDK 不支持弹窗，请到插件设置里添加规则")
+            return
+
+        builder = AlertDialogBuilder(activity)
+        try:
+            builder.set_title("添加规则 · {}".format(title))
+            builder.set_view(field)
+            builder.set_positive_button(
+                "添加",
+                partial(self._on_add_rule_from_dialog, peer_key, title, field, mode),
+            )
+            builder.set_negative_button("取消", lambda bld, _which: bld.dismiss())
+            builder.show()
+        except Exception as error:
+            self._error("添加规则弹窗失败: %s", error)
+            self._toast("error", "弹窗失败，请到插件设置里添加规则")
+
+    def _on_add_rule_from_dialog(
+        self,
+        peer_key: str,
+        title: str,
+        field: Any,
+        mode: int,
+        builder: Any,
+        _which: int,
+    ) -> None:
+        try:
+            builder.dismiss()
+        except Exception:
+            pass
+
+        try:
+            pattern = str(field.getText() or "").strip()
+        except Exception:
+            pattern = ""
+        if not pattern:
+            self._toast("error", "内容为空，没有添加")
+            return
+
+        error = validate_pattern(mode, pattern)
+        if error:
+            self._toast("error", error)
+            return
+
+        # 关键：只绑定到当前会话，不做全局生效
+        self._create_rule(pattern, mode, scope=peer_key, reload_settings=False)
+        self._toast("success", "已为「{}」添加规则".format(title))
+
+    # --- 二级对话框：单条规则的操作 ---
+
+    def _show_rule_actions(
+        self, peer_key: str, title: str, activity: Any, rule_id: str
+    ) -> None:
+        if AlertDialogBuilder is None:
+            return
+        enabled = bool(self.get_setting("rule_{}_enabled".format(rule_id), True))
+        items = ["禁用这条规则" if enabled else "启用这条规则", "删除这条规则"]
+        builder = AlertDialogBuilder(activity)
+        try:
+            builder.set_title(
+                "{} · {}".format(title, self._rule_title(rule_id))
+            )
+            builder.set_items(
+                items, partial(self._on_rule_action, peer_key, title, rule_id)
+            )
+            builder.set_negative_button("取消", lambda bld, _which: bld.dismiss())
+            builder.show()
+        except Exception as error:
+            self._error("规则操作弹窗失败: %s", error)
+
+    def _on_rule_action(
+        self, peer_key: str, title: str, rule_id: str, builder: Any, which: int
+    ) -> None:
+        try:
+            builder.dismiss()
+        except Exception:
+            pass
+        try:
+            if which == 0:
+                enabled = bool(self.get_setting("rule_{}_enabled".format(rule_id), True))
+                self.set_setting("rule_{}_enabled".format(rule_id), not enabled)
+                self._invalidate()
+                self._toast("info", "已{}规则".format("禁用" if enabled else "启用"))
+            else:
+                self._on_delete(rule_id)
+        except Exception as error:
+            self._error("处理规则操作失败: %s", error)
+
+    # ---------------- 诊断 ----------------
+
+    def _recent_log(self) -> List[str]:
+        history = self.get_setting("_filtered_log", [])
+        return history if isinstance(history, list) else []
+
+    def _page_log(self) -> List[Any]:
+        if not _UI_OK:
+            return []
+        entries = self._recent_log()
+        rows: List[Any] = [Header(text="过滤记录")]
+        rows.extend(self._activity_rows())
+        if not entries:
+            rows.append(
+                Text(
+                    text="还没有记录",
+                    subtext="打开「记录过滤记录」后，被改动的消息会出现在这里",
+                    icon="msg_info",
+                )
+            )
+            return rows
+        for entry in reversed(entries[-LOG_LIMIT:]):
+            rows.append(Text(text=str(entry)))
+        rows.append(Divider())
+        rows.append(
+            Text(
+                text="清空记录",
+                icon="msg_error",
+                red=True,
+                on_click=self._on_clear_log,
+            )
+        )
+        return rows
+
+    def _activity_rows(self) -> List[Any]:
+        rows: List[Any] = [Header(text="最近处理")]
+        if not self._activity:
+            rows.append(
+                Text(
+                    text="本次启动还没有命中过任何消息",
+                    subtext="如果有消息该被删却没动静，请打开「只观察不改」再看一次",
+                    icon="msg_info",
+                )
+            )
+            return rows
+        for entry in reversed(self._activity[-8:]):
+            rows.append(Text(text=str(entry)))
+        rows.append(Divider())
+        return rows
+
+    def _on_clear_log(self, _view: Any = None) -> None:
+        self._activity = []
+        self._log_written = 0
+        self.set_setting("_filtered_log", [], reload_settings=True)
+
+    def _on_self_check(self, _view: Any = None) -> None:
+        cfg = self._config()
+        rule_ids = self._rule_ids()
+        lines = [
+            "插件开关: {}".format(cfg["enabled"]),
+            "规则总数: {}（启用 {} 条）".format(len(rule_ids), len(cfg["rules"])),
+            "链接安全(等长隐身): {}".format(cfg["blank_fallback"]),
+            "修正实体偏移: {}".format(cfg["fix_entities"]),
+            "已见会话键: {}".format(sorted(self._seen_peers)[:12] or "（还没处理过消息）"),
+        ]
+        for rule in cfg["rules"]:
+            error = validate_pattern(rule["mode"], rule["pattern"])
+            lines.append(
+                "  - [{}/{}] mode={} pattern={!r}{}".format(
+                    rule["id"],
+                    TARGET_LABELS.get(rule["target"], "?"),
+                    MODE_ITEMS[rule["mode"]] if 0 <= rule["mode"] < len(MODE_ITEMS) else "?",
+                    rule["pattern"],
+                    "  ← {}".format(error) if error else "",
+                )
+            )
+        lines.append("标记: {} ({})".format(
+            "开" if cfg["marker_enabled"] else "关",
+            "开头" if cfg["marker_position"] == POS_PREFIX else "末尾",
+        ))
+        report = "\n".join(lines)
+        self._info("自检:\n%s", report)
+        self.set_setting("_self_check", report, reload_settings=False)
+        self._toast("info", "规则 {} 条，启用 {} 条".format(len(rule_ids), len(cfg["rules"])))
+
+    # ---------------- 日志 ----------------
+
+    @staticmethod
+    def _toast(kind: str, message: str) -> None:
+        """Bulletin 提示；SDK 没有这个能力时静默跳过。"""
+        if BulletinHelper is None:
+            return
+        try:
+            getattr(BulletinHelper, "show_" + kind)(message)
+        except Exception:
+            pass
+
+    def _info(self, message: str, *args: Any) -> None:
+        try:
+            self.logger.info(message, *args)
+            return
+        except Exception:
+            pass
+        try:
+            self.log(message % args if args else message)
+        except Exception:
+            pass
+
+    def _error(self, message: str, *args: Any) -> None:
+        try:
+            self.logger.error(message, *args)
+            return
+        except Exception:
+            pass
+        try:
+            self.log(message % args if args else message)
+        except Exception:
+            pass

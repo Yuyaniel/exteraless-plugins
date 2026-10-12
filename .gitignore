@@ -1,0 +1,23 @@
+# WorkBuddy 项目数据（本地 agent 状态，不是交付物）
+.workbuddy-ai/
+
+# 真机日志（含设备路径与会话 ID）
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 打包产物
+*.zip
+
+# OS / 编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+.cursor/

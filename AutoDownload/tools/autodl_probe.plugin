@@ -1,0 +1,406 @@
+"""Auto Download 追踪器（排障用）。
+
+为什么要有这个东西：主插件"不自动下载"的最大嫌疑是
+**我们挂的 canDownloadMedia(MessageObject) 根本没参与自动下载**——
+宿主真正的自动下载入口可能是另一个方法（比如只带 (int type, long size)
+的重载，或者 checkAutodownloadOrDownloadInQueue）。光看代码看不出来，
+必须实测哪个方法真的被调用了。
+
+本追踪器：
+1. 列出 DownloadController 的**全部**方法签名（含 AUTODOWNLOAD_* 常量）
+2. 把名字里含 autodownload / candownload 的方法**全部挂钩并计数**
+3. 每次调用记录：方法名、参数概要、返回值；见到 MessageObject 就额外
+   记下媒体类型与会话 id
+4. 结果**写文件**（不只打日志）——日志会被静默吞掉，文件不会
+5. 顺带查主插件 auto_download 是否已加载、挂上了几个钩子
+
+产出（都在插件目录下）：
+    autodl_probe_report.txt    方法清单 + 常量 + 主插件状态
+    autodl_probe_trace.txt     调用计数 + 详细样本
+"""
+
+import os
+import sys
+import time
+from typing import Any, Dict, List
+
+from base_plugin import BasePlugin, MethodHook  # pyright: ignore[reportMissingImports]
+from file_utils import get_plugins_dir  # pyright: ignore[reportMissingImports]
+from hook_utils import find_class  # pyright: ignore[reportMissingImports]
+from ui.settings import Header, Text  # pyright: ignore[reportMissingImports]
+
+__id__ = "autodl_probe"
+__name__ = "Auto Download Probe"
+__description__ = "排障用：追踪 DownloadController 的调用情况，结果写入文件"
+__author__ = "yourUsername"
+__version__ = "2.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+DC_CLASS_NAME = "org.telegram.messenger.DownloadController"
+FL_CLASS_NAME = "org.telegram.messenger.FileLoader"
+MAIN_PLUGIN_ID = "auto_download"
+
+REPORT_NAME = "autodl_probe_report.txt"
+TRACE_NAME = "autodl_probe_trace.txt"
+
+SAMPLE_LIMIT = 40
+HOOK_FILTER = ("autodownload", "candownload")
+
+
+def _safe(fn, default=None):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _simple_name(obj: Any) -> str:
+    return _safe(lambda: str(obj.getClass().getSimpleName()), "<unknown>")
+
+
+def _java_class(name: str) -> Any:
+    def load():
+        from java.lang import Class  # noqa: PLC0415
+        return Class.forName(name)
+    return _safe(load)
+
+
+def _signature(method: Any) -> str:
+    name = _safe(lambda: method.getName(), "?")
+    params = _safe(lambda: list(method.getParameterTypes()), [])
+    if params is None:
+        return name + "(?)"
+    parts = []
+    for param in (params or []):
+        parts.append(_safe(lambda: str(param.getSimpleName()), "?"))
+    return "{}({})".format(name, ", ".join(parts))
+
+
+class _TracerHook(MethodHook):
+    """记录一次调用：谁被调用、参数是什么、返回了什么。"""
+
+    def __init__(self, plugin: "ProbePlugin", label: str) -> None:
+        self.plugin = plugin
+        self.label = label
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            self.plugin._record(self.label, param)
+        except Exception:
+            pass
+
+
+class ProbePlugin(BasePlugin):
+    def on_plugin_load(self) -> None:
+        self._counts: Dict[str, int] = {}
+        self._samples: List[str] = []
+        self._hooks: List[str] = []
+        self._unhooks: List[Any] = []
+        self._report: List[str] = []
+
+        self._write_file(REPORT_NAME, "追踪器启动中…\n")
+
+        self._collect_class_facts()
+        self._collect_main_plugin_state()
+        self._install_hooks()
+
+        self._write_file(REPORT_NAME, "\n".join(self._report))
+        self._write_file(TRACE_NAME, self._format_trace())
+        self._log("追踪器就绪，已挂 {} 个方法".format(len(self._hooks)))
+
+    def on_plugin_unload(self) -> None:
+        for unhook in self._unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks = []
+
+    # ---------------- 静态事实 ----------------
+
+    def _collect_class_facts(self) -> None:
+        self._report.append("Auto Download 追踪报告")
+        self._report.append("=" * 62)
+        self._report.append("")
+        self._report.append("生成时间: {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
+
+        sdk = _safe(lambda: __import__("_sdk_version").__version__)
+        self._report.append("SDK 版本: {}".format(sdk or "<读取失败>"))
+
+        self._report.append("")
+        self._report.append("## 1. {} 的 AUTODOWNLOAD_* 常量".format(DC_CLASS_NAME))
+        dc = _java_class(DC_CLASS_NAME)
+        if dc is None:
+            self._report.append("  !! 找不到该类 —— 主插件必然不工作")
+        else:
+            fields = _safe(lambda: list(dc.getDeclaredFields()), []) or []
+            hit = False
+            for field in fields:
+                name = _safe(lambda: field.getName(), "") or ""
+                if not name.startswith("AUTODOWNLOAD_"):
+                    continue
+                hit = True
+                ftype = _safe(lambda: field.getType().getName(), "?")
+                value = _safe(lambda: str(field.get(None)), "?")
+                self._report.append("  {} : {} = {}".format(name, ftype, value))
+            if not hit:
+                self._report.append(
+                    "  !! 没有 AUTODOWNLOAD_ 字段 —— 主插件读不到常量，会直接放弃干预"
+                )
+
+        self._report.append("")
+        self._report.append("## 2. {} 的全部方法".format(DC_CLASS_NAME))
+        if dc is None:
+            self._report.append("  !! 找不到该类")
+        else:
+            methods = _safe(lambda: list(dc.getDeclaredMethods()), []) or []
+            for method in sorted(methods, key=lambda m: _safe(lambda: m.getName(), "")):
+                self._report.append("  {}".format(_signature(method)))
+
+        self._report.append("")
+        self._report.append("## 3. {} 的 loadFile 重载".format(FL_CLASS_NAME))
+        fl = _java_class(FL_CLASS_NAME)
+        if fl is None:
+            self._report.append("  !! 找不到 FileLoader")
+        else:
+            methods = _safe(lambda: list(fl.getDeclaredMethods()), []) or []
+            for method in methods:
+                name = _safe(lambda: method.getName(), "") or ""
+                if "loadFile" in name or "download" in name.lower():
+                    self._report.append("  {}".format(_signature(method)))
+
+    def _collect_main_plugin_state(self) -> None:
+        self._report.append("")
+        self._report.append("## 4. 主插件 auto_download 的状态")
+        module = sys.modules.get(MAIN_PLUGIN_ID)
+        if module is None:
+            self._report.append(
+                "  !! sys.modules 里没有 {} —— 主插件未加载".format(MAIN_PLUGIN_ID)
+            )
+            self._report.append("     检查：是否启用、是否重启过、logcat 有没有报错")
+            return
+        self._report.append("  已加载: 是")
+
+        instance = getattr(module, "_ACTIVE_INSTANCE", None)
+        if instance is None:
+            self._report.append("  !! 模块在但拿不到 _ACTIVE_INSTANCE —— 可能加载中断")
+            return
+
+        caps = getattr(instance, "_caps", None)
+        if caps is None:
+            self._report.append("  !! 拿不到 _caps")
+        else:
+            values = getattr(caps, "values", None) or {}
+            self._report.append(
+                "  读到的常量: {}".format(values or "（空 —— 主插件会放弃干预）")
+            )
+            self._report.append("  已挂钩重载数: {}".format(getattr(caps, "hooked", "?")))
+            notes = getattr(caps, "notes", None) or []
+            for note in notes:
+                self._report.append("  备注: {}".format(note))
+
+        unhooks = getattr(instance, "_unhooks", None) or []
+        self._report.append("  实例持有钩子数: {}".format(len(unhooks)))
+        try:
+            self._report.append("  配置快照: {}".format(instance._config()))
+        except Exception as error:
+            self._report.append("  配置快照读取失败: {}".format(error))
+
+    def _install_hooks(self) -> None:
+        dc = _java_class(DC_CLASS_NAME)
+        if dc is None:
+            self._report.append("")
+            self._report.append("## 5. 挂钩")
+            self._report.append("  !! 找不到类，无法挂钩")
+            return
+
+        self._report.append("")
+        self._report.append("## 5. 已挂钩的方法（名字含 {}）".format(" / ".join(HOOK_FILTER)))
+        methods = _safe(lambda: list(dc.getDeclaredMethods()), []) or []
+        for method in methods:
+            name = (_safe(lambda: method.getName(), "") or "").lower()
+            if not any(token in name for token in HOOK_FILTER):
+                continue
+            signature = _signature(method)
+            try:
+                method.setAccessible(True)
+                unhook = self.hook_method(method, _TracerHook(self, signature))
+            except Exception as error:
+                self._report.append("  {} !! 挂钩失败: {}".format(signature, error))
+                continue
+            if unhook:
+                self._unhooks.append(unhook)
+                self._hooks.append(signature)
+                self._counts[signature] = 0
+                self._report.append("  {}".format(signature))
+            else:
+                self._report.append("  {} !! 返回空".format(signature))
+
+    # ---------------- 采样 ----------------
+
+    def _record(self, label: str, param: Any) -> None:
+        self._counts[label] = self._counts.get(label, 0) + 1
+
+        args = getattr(param, "args", None)
+        arg0 = args[0] if args and len(args) >= 1 else None
+        detail = ""
+
+        if arg0 is not None and hasattr(arg0, "messageOwner"):
+            kind = self._classify(arg0)
+            peer = self._peer_key_of(arg0)
+            media = self._media_of(arg0)
+            detail = "媒体={} 类型={} 会话={}".format(media, kind, peer)
+        elif arg0 is not None:
+            detail = "参数0={}({})".format(_simple_name(arg0), arg0)
+        else:
+            rest = ", ".join(str(a) for a in (args or [])[:4])
+            detail = "参数=(int/long 重载?) {}".format(rest)
+
+        try:
+            result = str(param.getResult())
+        except Exception:
+            result = "?"
+
+        if len(self._samples) < SAMPLE_LIMIT:
+            self._samples.append(
+                "#{:<3} {:<52} 返回值={:<6} {}".format(
+                    sum(self._counts.values()), label[:52], result, detail
+                )
+            )
+            self._write_file(TRACE_NAME, self._format_trace())
+
+    def _classify(self, message_object: Any) -> Any:
+        media = _safe(lambda: getattr(message_object.messageOwner, "media", None))
+        if media is None:
+            return None
+        name = _simple_name(media)
+        if name == "TL_messageMediaPhoto":
+            return "photo"
+        if name == "TL_messageMediaDocument":
+            document = _safe(lambda: media.document)
+            if document is None:
+                return None
+            names = set()
+            attributes = _safe(lambda: document.attributes)
+            count = _safe(lambda: int(attributes.size())) or 0
+            for index in range(count):
+                names.add(_simple_name(_safe(lambda: attributes.get(index))))
+            if "TL_documentAttributeVideo" in names:
+                return "video"
+            if "TL_documentAttributeAnimated" in names:
+                return "gif"
+            if "TL_documentAttributeAudio" in names:
+                return "audio"
+            if "TL_documentAttributeSticker" in names:
+                return "sticker"
+            return "file"
+        return None
+
+    def _media_of(self, message_object: Any) -> Any:
+        media = _safe(lambda: getattr(message_object.messageOwner, "media", None))
+        return _simple_name(media) if media is not None else None
+
+    @staticmethod
+    def _peer_key_of(message_object: Any) -> Any:
+        owner = _safe(lambda: message_object.messageOwner)
+        if owner is None:
+            return None
+        dialog_id = _safe(lambda: int(owner.dialog_id)) or 0
+        if not dialog_id:
+            peer = _safe(lambda: owner.peer_id)
+            if peer is not None:
+                for attr, sign in (
+                    ("user_id", 1),
+                    ("chat_id", -1),
+                    ("channel_id", -1),
+                ):
+                    value = _safe(lambda: int(getattr(peer, attr, 0))) or 0
+                    if value:
+                        dialog_id = sign * value
+                        break
+        return str(dialog_id) if dialog_id else None
+
+    # ---------------- 输出 ----------------
+
+    def _format_trace(self) -> str:
+        lines = ["调用追踪（样本上限 {}）".format(SAMPLE_LIMIT), "=" * 62, ""]
+        lines.append("## 调用计数")
+        if not self._counts:
+            lines.append("  （一个都没被调用 —— 这就是问题所在）")
+        for label, count in sorted(self._counts.items(), key=lambda kv: -kv[1]):
+            lines.append("  {:>5} 次   {}".format(count, label))
+        lines.append("")
+        lines.append("## 详细样本")
+        lines.extend(self._samples or ["  （还没有样本）"])
+        lines.append("")
+        lines.append("判读：")
+        lines.append("  - 若 canDownloadMedia(MessageObject) 计数为 0，但")
+        lines.append(
+            "    (int, long) 重载有计数 ⇒ 自动下载走的是后者，它不带会话信息，"
+        )
+        lines.append(
+            "    主插件必须换挂点（不能只靠这个重载做按会话控制）"
+        )
+        lines.append("  - 若两个都是 0 ⇒ 宿主根本没走 DownloadController 这条路径，")
+        lines.append("    或应用自身的自动下载总开关是关的")
+        return "\n".join(lines)
+
+    def _write_file(self, name: str, content: str) -> None:
+        try:
+            path = os.path.join(get_plugins_dir(), name)
+            parent = os.path.dirname(path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        except Exception as error:
+            self._log("写文件失败: %s", error)
+
+    # ---------------- 设置页 ----------------
+
+    def create_settings(self) -> List[Any]:
+        total = sum(self._counts.values())
+        return [
+            Header(text="Auto Download 追踪器"),
+            Text(
+                text="重写报告文件",
+                subtext=REPORT_NAME,
+                icon="msg_info",
+                on_click=self._on_rewrite,
+            ),
+            Text(
+                text="已捕获调用总数",
+                subtext=str(total),
+                icon="msg_settings",
+            ),
+            Text(
+                text="清零计数",
+                subtext="重新开始统计",
+                icon="msg_error",
+                red=True,
+                on_click=self._on_reset,
+            ),
+        ]
+
+    def _on_rewrite(self, _view: Any = None) -> None:
+        self._collect_main_plugin_state()
+        self._write_file(REPORT_NAME, "\n".join(self._report))
+        self._write_file(TRACE_NAME, self._format_trace())
+
+    def _on_reset(self, _view: Any = None) -> None:
+        for key in self._counts:
+            self._counts[key] = 0
+        self._samples = []
+
+    def _log(self, message: str, *args: Any) -> None:
+        try:
+            self.logger.info(message, *args)
+            return
+        except Exception:
+            pass
+        try:
+            self.log(message % args if args else message)
+        except Exception:
+            pass

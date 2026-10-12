@@ -1,0 +1,3 @@
+# `.plugin` 就是 Python 源码（仓库里不换后缀，推到设备时改名成 .py）
+# 只做 GitHub 语言高亮的提示，不做任何换行符转换 —— 文件按原样（LF）存储
+*.plugin linguist-language=Python
